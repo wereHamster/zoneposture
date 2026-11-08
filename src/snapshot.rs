@@ -82,8 +82,12 @@ pub async fn snapshot(resolver: &impl Resolve, names: &[String]) -> Result<Snaps
     }
 
     for owner in caa_owners(&visited, &apex) {
-        let found = resolver.query(&owner, Qtype::Caa).await?;
-        records.extend(found.into_iter().filter(|rr| rr.owner == owner));
+        match resolver.query(&owner, Qtype::Caa).await {
+            Ok(found) => records.extend(found.into_iter().filter(|rr| rr.owner == owner)),
+            Err(err) => warnings.push(format!(
+                "{err}; CAA lookup skipped, the snapshot may be missing CAA records at {owner}"
+            )),
+        }
     }
 
     let probe = format!("{}.{apex}", random_label());
@@ -639,11 +643,41 @@ mod tests {
         let mut resolver = client_zone();
         resolver
             .errors
-            .insert(("client.com", Qtype::Caa), "SERVFAIL".to_string());
+            .insert(("www.client.com", Qtype::A), "SERVFAIL".to_string());
         let err = snapshot(&resolver, &names(&["www.client.com"]))
             .await
             .unwrap_err();
         assert_eq!(err, "SERVFAIL");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_caa_lookup_is_a_warning() {
+        let mut resolver = client_zone().with(
+            "www.client.com",
+            Qtype::A,
+            Rdata::A("192.0.2.1".parse().unwrap()),
+        );
+        resolver.errors.insert(
+            ("client.com", Qtype::Caa),
+            "client.com: Caa query failed: all timed out".to_string(),
+        );
+
+        let snapshot = snapshot(&resolver, &names(&["www.client.com"]))
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.warnings.len(), 1, "{:?}", snapshot.warnings);
+        assert!(
+            snapshot.warnings[0].contains("Caa query failed: all timed out; CAA lookup skipped"),
+            "{}",
+            snapshot.warnings[0]
+        );
+        assert!(
+            snapshot
+                .records
+                .iter()
+                .any(|rr| rr.owner == "www.client.com")
+        );
     }
 
     fn txt(text: &str) -> Rdata {
