@@ -2,6 +2,7 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
+    Info,
     Pass,
     Warn,
     Fail,
@@ -10,6 +11,7 @@ pub enum Severity {
 impl fmt::Display for Severity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad(match self {
+            Severity::Info => "INFO",
             Severity::Pass => "PASS",
             Severity::Warn => "WARN",
             Severity::Fail => "FAIL",

@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 use domain::base::iana::Class;
@@ -135,32 +135,43 @@ impl Zone {
             .map(|r| &r.data)
     }
 
-    /// Names to probe over the network, in file order: every name with A,
-    /// AAAA, or CNAME records, except service names (`_dmarc`, `_domainkey`,
-    /// …), wildcards, and names whose addresses are all non-public.
-    pub fn web_hosts(&self) -> Vec<&str> {
-        let mut hosts: Vec<&str> = Vec::new();
+    /// Every name with A, AAAA, or CNAME records, in file order, except
+    /// service names (`_dmarc`, `_domainkey`, …), which are not web hosts.
+    pub fn web_hosts(&self) -> Vec<WebHost<'_>> {
+        let mut hosts: Vec<WebHost> = Vec::new();
         for record in &self.records {
             let name = record.name.as_str();
             if !record.data.is_host()
-                || hosts.contains(&name)
-                || name
-                    .split('.')
-                    .any(|label| label.starts_with('_') || label == "*")
+                || hosts.iter().any(|host| host.name == name)
+                || name.split('.').any(|label| label.starts_with('_'))
             {
                 continue;
             }
-            let reachable = self.records_at(name).any(|data| match data {
-                RecordData::A(addr) => is_public_v4(addr),
-                RecordData::Aaaa(addr) => is_public_v6(addr),
-                RecordData::Cname(_) => true,
-                _ => false,
-            });
-            if reachable {
-                hosts.push(name);
-            }
+
+            let skip = if name.split('.').any(|label| label == "*") {
+                Some(Skip::Wildcard)
+            } else {
+                self.non_public_only(name).map(Skip::NonPublic)
+            };
+            hosts.push(WebHost { name, skip });
         }
         hosts
+    }
+
+    /// The addresses of `name` with the kind of range they belong to, if all
+    /// of them are non-public and there is no CNAME.
+    fn non_public_only(&self, name: &str) -> Option<Vec<(IpAddr, &'static str)>> {
+        let mut addresses = Vec::new();
+        for data in self.records_at(name) {
+            let addr = match data {
+                RecordData::A(addr) => IpAddr::V4(*addr),
+                RecordData::Aaaa(addr) => IpAddr::V6(*addr),
+                RecordData::Cname(_) => return None,
+                _ => continue,
+            };
+            addresses.push((addr, non_public_range(&addr)?));
+        }
+        (!addresses.is_empty()).then_some(addresses)
     }
 
     pub fn txt_at<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
@@ -171,24 +182,57 @@ impl Zone {
     }
 }
 
-fn is_public_v4(addr: &Ipv4Addr) -> bool {
-    let shared = addr.octets()[0] == 100 && (addr.octets()[1] & 0xc0) == 64;
-    !(addr.is_private()
-        || addr.is_loopback()
-        || addr.is_link_local()
-        || addr.is_unspecified()
-        || addr.is_broadcast()
-        || addr.is_documentation()
-        || shared)
+/// A host to probe over the network, unless `skip` says why not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebHost<'a> {
+    pub name: &'a str,
+    pub skip: Option<Skip>,
 }
 
-fn is_public_v6(addr: &Ipv6Addr) -> bool {
-    let documentation = addr.segments()[0] == 0x2001 && addr.segments()[1] == 0x0db8;
-    !(addr.is_loopback()
-        || addr.is_unspecified()
-        || addr.is_unique_local()
-        || addr.is_unicast_link_local()
-        || documentation)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Skip {
+    Wildcard,
+    /// All addresses, each with the kind of non-public range it is in.
+    NonPublic(Vec<(IpAddr, &'static str)>),
+}
+
+pub fn non_public_range(addr: &IpAddr) -> Option<&'static str> {
+    match addr {
+        IpAddr::V4(addr) => {
+            let [a, b, ..] = addr.octets();
+            if addr.is_loopback() {
+                Some("loopback")
+            } else if addr.is_private() {
+                Some("private")
+            } else if addr.is_link_local() {
+                Some("link-local")
+            } else if a == 100 && (b & 0xc0) == 64 {
+                Some("carrier-grade NAT")
+            } else if addr.is_documentation() {
+                Some("documentation")
+            } else if addr.is_unspecified() || addr.is_broadcast() {
+                Some("unspecified")
+            } else {
+                None
+            }
+        }
+        IpAddr::V6(addr) => {
+            let [a, b, ..] = addr.segments();
+            if addr.is_loopback() {
+                Some("loopback")
+            } else if addr.is_unique_local() {
+                Some("private")
+            } else if addr.is_unicast_link_local() {
+                Some("link-local")
+            } else if a == 0x2001 && b == 0x0db8 {
+                Some("documentation")
+            } else if addr.is_unspecified() {
+                Some("unspecified")
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn normalize_name(name: String) -> String {
@@ -333,9 +377,33 @@ mixed             A     9.9.9.9
 ",
         )
         .unwrap();
+        let probe = |name| WebHost { name, skip: None };
+        let non_public = |name, addresses: &[(&str, &'static str)]| WebHost {
+            name,
+            skip: Some(Skip::NonPublic(
+                addresses
+                    .iter()
+                    .map(|(addr, range)| (addr.parse().unwrap(), *range))
+                    .collect(),
+            )),
+        };
         assert_eq!(
             zone.web_hosts(),
-            ["example.com", "www.example.com", "mixed.example.com"]
+            [
+                probe("example.com"),
+                probe("www.example.com"),
+                WebHost {
+                    name: "*.example.com",
+                    skip: Some(Skip::Wildcard)
+                },
+                non_public("dev.example.com", &[("127.0.0.1", "loopback")]),
+                non_public(
+                    "lan.example.com",
+                    &[("10.0.0.1", "private"), ("fd00::1", "private")]
+                ),
+                non_public("cgnat.example.com", &[("100.64.0.1", "carrier-grade NAT")]),
+                probe("mixed.example.com"),
+            ]
         );
     }
 

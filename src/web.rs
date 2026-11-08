@@ -7,24 +7,35 @@ use crate::finding::{Finding, Severity};
 use crate::headers;
 use crate::http::{Clients, Response, fetch};
 use crate::security_txt;
-use crate::zone::Zone;
+use crate::tls;
+use crate::zone::{Skip, Zone};
 
 const CONCURRENT_HOSTS: usize = 16;
 const MAX_HTTP_REDIRECTS: usize = 10;
 
 /// Findings of the checks that connect to the zone's web hosts, each grouped
-/// by host in the order of [`Zone::web_hosts`]. A host whose HTTPS endpoint
-/// cannot be reached appears only in `https`.
+/// by host in the order of [`Zone::web_hosts`]. A skipped host appears only in
+/// `https`, and a host whose HTTPS endpoint cannot be reached appears only in
+/// `https` and `certificates`.
 #[derive(Default)]
 pub struct Report {
     pub https: Vec<Finding>,
+    pub certificates: Vec<Finding>,
     pub headers: Vec<Finding>,
     pub disclosure: Vec<Finding>,
 }
 
-pub async fn audit(clients: &Clients, zone: &Zone, now: Timestamp) -> Report {
+pub async fn audit(clients: &Clients, tls: &tls::Context, zone: &Zone, now: Timestamp) -> Report {
     let reports: Vec<Report> = stream::iter(zone.web_hosts())
-        .map(|host| audit_host(clients, host, host == zone.apex, now))
+        .map(|host| async move {
+            match &host.skip {
+                Some(skip) => Report {
+                    https: vec![skipped(host.name, skip, &zone.apex)],
+                    ..Report::default()
+                },
+                None => audit_host(clients, tls, zone, host.name, now).await,
+            }
+        })
         .buffered(CONCURRENT_HOSTS)
         .collect()
         .await;
@@ -32,6 +43,7 @@ pub async fn audit(clients: &Clients, zone: &Zone, now: Timestamp) -> Report {
     let mut report = Report::default();
     for host in reports {
         report.https.extend(host.https);
+        report.certificates.extend(host.certificates);
         report.headers.extend(host.headers);
         report.disclosure.extend(host.disclosure);
     }
@@ -47,11 +59,47 @@ fn finding(host: &str, severity: Severity, message: String) -> Finding {
     }
 }
 
-async fn audit_host(clients: &Clients, host: &str, is_apex: bool, now: Timestamp) -> Report {
+fn skipped(host: &str, skip: &Skip, apex: &str) -> Finding {
+    match skip {
+        Skip::Wildcard => finding(
+            host,
+            Severity::Info,
+            "wildcard name; not probed".to_string(),
+        ),
+        Skip::NonPublic(addresses) => {
+            let list: Vec<String> = addresses
+                .iter()
+                .map(|(addr, range)| format!("{addr} ({range})"))
+                .collect();
+            let consequence = if addresses.iter().any(|(_, range)| *range == "loopback") {
+                format!("a loopback name lets local services count as same-site with {apex}")
+            } else {
+                "publishing them reveals internal network layout".to_string()
+            };
+            finding(
+                host,
+                Severity::Warn,
+                format!(
+                    "not probed: only non-public addresses {}; {consequence}",
+                    list.join(", ")
+                ),
+            )
+        }
+    }
+}
+
+async fn audit_host(
+    clients: &Clients,
+    tls: &tls::Context,
+    zone: &Zone,
+    host: &str,
+    now: Timestamp,
+) -> Report {
     let url = format!("https://{host}/");
-    let (root, redirect) = tokio::join!(
+    let (root, redirect, certificates) = tokio::join!(
         fetch(&clients.https, &url, false),
-        check_http_redirect(clients, host)
+        check_http_redirect(clients, host),
+        tls::check_host(tls, zone, host, now),
     );
 
     match root {
@@ -60,11 +108,13 @@ async fn audit_host(clients: &Clients, host: &str, is_apex: bool, now: Timestamp
                 finding(host, Severity::Fail, format!("{url}: {err}")),
                 redirect,
             ],
+            certificates,
             ..Report::default()
         },
         Ok(response) => Report {
             https: vec![redirect],
-            headers: headers::grade(host, is_apex, &response),
+            certificates,
+            headers: headers::grade(host, host == zone.apex, &response),
             disclosure: security_txt::check_host(&clients.https, host, now).await,
         },
     }
@@ -163,6 +213,38 @@ fn classify_http_response(host: &str, start: &str, url: &str, response: &Respons
 mod tests {
     use super::*;
     use crate::http::response;
+
+    fn skip_message(skip: Skip) -> (Severity, String) {
+        let finding = skipped("dev.example.com", &skip, "example.com");
+        (finding.severity, finding.message)
+    }
+
+    #[test]
+    fn skipped_hosts_are_reported() {
+        assert_eq!(
+            skip_message(Skip::Wildcard),
+            (Severity::Info, "wildcard name; not probed".to_string())
+        );
+        assert_eq!(
+            skip_message(Skip::NonPublic(vec![("127.0.0.1".parse().unwrap(), "loopback")])),
+            (
+                Severity::Warn,
+                "not probed: only non-public addresses 127.0.0.1 (loopback); a loopback name lets local services count as same-site with example.com"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            skip_message(Skip::NonPublic(vec![
+                ("10.0.0.1".parse().unwrap(), "private"),
+                ("fd00::1".parse().unwrap(), "private"),
+            ])),
+            (
+                Severity::Warn,
+                "not probed: only non-public addresses 10.0.0.1 (private), fd00::1 (private); publishing them reveals internal network layout"
+                    .to_string()
+            )
+        );
+    }
 
     const START: &str = "http://example.com/";
 

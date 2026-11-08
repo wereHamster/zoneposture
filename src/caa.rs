@@ -142,6 +142,51 @@ fn check_record_set(owner: &str, properties: &[Property]) -> Vec<Finding> {
 
 /// Returns the issuer domain of an `issue` or `issuewild` value, or `None` if
 /// the value authorizes no CA (e.g. `";"`).
+/// Finds the CAA record set that applies to `host`, the first one from `host`
+/// up to the apex, and returns its owner and the CA domains it allows. For a
+/// wildcard certificate, `issuewild` applies if present. Returns `None` if no
+/// record set applies or it does not restrict issuance.
+pub fn allowed_issuers(zone: &Zone, host: &str, wildcard: bool) -> Option<(String, Vec<String>)> {
+    let mut name = host;
+    loop {
+        let properties: Vec<(&str, &str)> = zone
+            .records_at(name)
+            .filter_map(|data| match data {
+                RecordData::Caa { tag, value, .. } => Some((tag.as_str(), value.as_str())),
+                _ => None,
+            })
+            .collect();
+
+        if !properties.is_empty() {
+            let has_issuewild = properties.iter().any(|(tag, _)| *tag == "issuewild");
+            let tag = if wildcard && has_issuewild {
+                "issuewild"
+            } else {
+                "issue"
+            };
+            let values: Vec<&str> = properties
+                .iter()
+                .filter(|(t, _)| *t == tag)
+                .map(|(_, value)| *value)
+                .collect();
+            if values.is_empty() {
+                return None;
+            }
+            let issuers: BTreeSet<String> =
+                values.iter().filter_map(|value| issuer(value)).collect();
+            return Some((name.to_string(), issuers.into_iter().collect()));
+        }
+
+        if name == zone.apex {
+            return None;
+        }
+        name = name.split_once('.')?.1;
+        if !name.ends_with(zone.apex.as_str()) {
+            return None;
+        }
+    }
+}
+
 fn issuer(value: &str) -> Option<String> {
     let domain = value.split(';').next().unwrap_or_default().trim();
     (!domain.is_empty()).then(|| domain.to_ascii_lowercase())
@@ -351,6 +396,36 @@ www CAA 0 iodef \"mailto:security@example.com\"
         );
         let subjects: Vec<String> = results(&zone).into_iter().map(|(s, _, _)| s).collect();
         assert_eq!(subjects, ["example.com", "example.com", "www.example.com"]);
+    }
+
+    #[test]
+    fn allowed_issuers_climb_to_the_closest_record_set() {
+        let zone = zone(
+            "@ CAA 0 issue \"letsencrypt.org\"
+@ CAA 0 issue \"pki.goog; cansignhttpexchanges=yes\"
+@ CAA 0 issuewild \";\"
+shop CAA 0 issue \"digicert.com\"
+iodef-only CAA 0 iodef \"mailto:s@example.com\"
+",
+        );
+        let allowed = |host, wildcard| allowed_issuers(&zone, host, wildcard);
+        let set = |owner: &str, issuers: &[&str]| {
+            Some((
+                owner.to_string(),
+                issuers.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+            ))
+        };
+
+        assert_eq!(
+            allowed("www.example.com", false),
+            set("example.com", &["letsencrypt.org", "pki.goog"])
+        );
+        assert_eq!(allowed("www.example.com", true), set("example.com", &[]));
+        assert_eq!(
+            allowed("a.shop.example.com", true),
+            set("shop.example.com", &["digicert.com"])
+        );
+        assert_eq!(allowed("iodef-only.example.com", false), None);
     }
 
     #[test]

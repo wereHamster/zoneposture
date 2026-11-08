@@ -4,6 +4,7 @@ mod finding;
 mod headers;
 mod http;
 mod security_txt;
+mod tls;
 mod web;
 mod zone;
 
@@ -53,15 +54,25 @@ async fn main() -> ExitCode {
                 }
             };
 
+            let tls = match tls::Context::new() {
+                Ok(tls) => tls,
+                Err(err) => {
+                    eprintln!("error: cannot set up TLS: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
             print_hosts(&zone);
             println!();
             print_findings("Email", &email::audit(&zone));
             println!();
-            print_findings("TLS", &caa::audit(&zone));
+            print_findings("CAA", &caa::audit(&zone));
 
-            let web = web::audit(&clients, &zone, Timestamp::now()).await;
+            let web = web::audit(&clients, &tls, &zone, Timestamp::now()).await;
             println!();
             print_findings("HTTPS", &web.https);
+            println!();
+            print_findings("Certificates", &web.certificates);
             println!();
             print_findings("Security headers", &web.headers);
             println!();
