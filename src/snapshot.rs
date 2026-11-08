@@ -87,9 +87,16 @@ pub async fn snapshot(resolver: &impl Resolve, names: &[String]) -> Result<Snaps
     }
 
     let probe = format!("{}.{apex}", random_label());
-    for mut rr in host_records(resolver, &probe).await? {
-        rr.owner = format!("*.{apex}");
-        records.push(rr);
+    match host_records(resolver, &probe).await {
+        Ok(found) => {
+            for mut rr in found {
+                rr.owner = format!("*.{apex}");
+                records.push(rr);
+            }
+        }
+        Err(err) => warnings.push(format!(
+            "{err}; wildcard probe skipped, the snapshot may be missing a wildcard record"
+        )),
     }
 
     Ok(Snapshot {
@@ -391,6 +398,7 @@ mod tests {
         answers: HashMap<(&'static str, Qtype), Vec<Rr>>,
         errors: HashMap<(&'static str, Qtype), String>,
         wildcard: Option<Rr>,
+        probe_error: Option<String>,
         queries: RefCell<Vec<(String, Qtype)>>,
     }
 
@@ -415,6 +423,9 @@ mod tests {
                 return Err(err.clone());
             }
             if name.starts_with("zp-") {
+                if let Some(err) = &self.probe_error {
+                    return Err(format!("{name}: {err}"));
+                }
                 return Ok(match (&self.wildcard, qtype) {
                     (Some(rr), q) if rr.data.qtype() == q => {
                         vec![Rr {
@@ -776,6 +787,26 @@ mod tests {
                 "{owner}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_wildcard_probe_is_a_warning() {
+        let resolver = Fake {
+            probe_error: Some("A query failed: all timed out".to_string()),
+            ..client_zone().with(
+                "client.com",
+                Qtype::A,
+                Rdata::A("192.0.2.1".parse().unwrap()),
+            )
+        };
+
+        let snapshot = snapshot(&resolver, &names(&["client.com"])).await.unwrap();
+
+        assert_eq!(snapshot.warnings.len(), 1, "{:?}", snapshot.warnings);
+        assert!(
+            snapshot.warnings[0].contains("A query failed: all timed out; wildcard probe skipped")
+        );
+        assert!(snapshot.records.iter().any(|rr| rr.owner == "client.com"));
     }
 
     #[tokio::test(flavor = "current_thread")]
