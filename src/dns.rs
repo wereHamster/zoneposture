@@ -1,11 +1,14 @@
+use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
+use std::time::Duration;
 
 use domain::base::iana::{Rcode, Rtype};
 use domain::base::name::Name;
 use domain::base::question::Question;
 use domain::rdata::AllRecordData;
 use domain::resolv::StubResolver;
+use domain::resolv::stub::conf::ResolvConf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Qtype {
@@ -93,12 +96,24 @@ pub trait Resolve {
     async fn query(&self, name: &str, qtype: Qtype) -> Result<Vec<Rr>, String>;
 }
 
+/// The stub resolver sends each query once, and a single lost UDP packet
+/// would otherwise fail a lookup.
+const ATTEMPTS: usize = 3;
+
+/// Per attempt, so a lookup that is never answered fails after
+/// `ATTEMPTS * TIMEOUT` instead of the stub resolver's default of 5 seconds
+/// per attempt.
+const TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Resolves through the servers in the system's resolver configuration.
 pub struct System(StubResolver);
 
 impl System {
     pub fn new() -> Self {
-        System(StubResolver::new())
+        let mut conf = ResolvConf::default();
+        conf.options.timeout = TIMEOUT;
+        conf.finalize();
+        System(StubResolver::from_conf(conf))
     }
 }
 
@@ -107,11 +122,17 @@ impl Resolve for System {
         let fail = |err: &dyn std::fmt::Display| format!("{name}: {qtype:?} query failed: {err}");
 
         let qname = Name::<Vec<u8>>::from_str(&format!("{name}.")).map_err(|e| fail(&e))?;
-        let answer = self
-            .0
-            .query(Question::new_in(qname, qtype.rtype()))
-            .await
-            .map_err(|e| fail(&e))?;
+        let question = Question::new_in(qname, qtype.rtype());
+        let mut attempt = 1;
+        let answer = loop {
+            match self.0.query(question.clone()).await {
+                Ok(answer) => break answer,
+                Err(err) if err.kind() == io::ErrorKind::TimedOut && attempt < ATTEMPTS => {
+                    attempt += 1;
+                }
+                Err(err) => return Err(fail(&format!("{err} (attempt {attempt} of {ATTEMPTS})"))),
+            }
+        };
         match answer.header().rcode() {
             Rcode::NOERROR | Rcode::NXDOMAIN => {}
             rcode => return Err(fail(&rcode)),
