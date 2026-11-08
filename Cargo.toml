@@ -1,0 +1,8 @@
+[package]
+name = "zoneposture"
+version = "0.1.0"
+edition = "2024"
+description = "Audits a DNS zone against modern web security standards"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
