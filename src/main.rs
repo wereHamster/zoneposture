@@ -1,7 +1,10 @@
 mod caa;
 mod email;
 mod finding;
+mod headers;
+mod http;
 mod security_txt;
+mod web;
 mod zone;
 
 use std::path::PathBuf;
@@ -11,6 +14,7 @@ use clap::{Parser, Subcommand};
 use jiff::Timestamp;
 
 use crate::finding::Finding;
+use crate::http::Clients;
 use crate::zone::Zone;
 
 #[derive(Parser)]
@@ -41,8 +45,8 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let client = match security_txt::client() {
-                Ok(client) => client,
+            let clients = match Clients::new() {
+                Ok(clients) => clients,
                 Err(err) => {
                     eprintln!("error: cannot create HTTP client: {err}");
                     return ExitCode::FAILURE;
@@ -54,11 +58,14 @@ async fn main() -> ExitCode {
             print_findings("Email", &email::audit(&zone));
             println!();
             print_findings("TLS", &caa::audit(&zone));
+
+            let web = web::audit(&clients, &zone, Timestamp::now()).await;
             println!();
-            print_findings(
-                "Vulnerability disclosure",
-                &security_txt::audit(&client, &zone.web_hosts(), Timestamp::now()).await,
-            );
+            print_findings("HTTPS", &web.https);
+            println!();
+            print_findings("Security headers", &web.headers);
+            println!();
+            print_findings("Vulnerability disclosure", &web.disclosure);
 
             ExitCode::SUCCESS
         }

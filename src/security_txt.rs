@@ -1,139 +1,40 @@
-use std::error::Error;
-use std::time::Duration;
-
-use futures::stream::{self, StreamExt};
 use jiff::Timestamp;
-use reqwest::header::CONTENT_TYPE;
-use reqwest::{Client, redirect};
+use reqwest::Client;
 
 use crate::finding::{Finding, Severity};
+use crate::http::{MAX_BODY_BYTES, Response, fetch};
 
 const CHECK: &str = "security.txt";
-const MAX_BODY_BYTES: usize = 64 * 1024;
-const CONCURRENT_HOSTS: usize = 16;
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
-pub fn client() -> reqwest::Result<Client> {
-    Client::builder()
-        .user_agent(concat!("zoneposture/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .redirect(redirect::Policy::custom(|attempt| {
-            if attempt.url().scheme() != "https" {
-                attempt.error("redirect to a non-HTTPS URL")
-            } else if attempt.previous().len() >= 10 {
-                attempt.error("too many redirects")
-            } else {
-                attempt.follow()
-            }
-        }))
-        .build()
+/// Many servers answer unknown paths with `200` and an HTML page, so only a
+/// plain-text response counts as a security.txt file.
+fn is_found(response: &Response) -> bool {
+    response.status == 200 && response.media_type().as_deref() == Some("text/plain")
 }
 
-/// Checks each host for an RFC 9116 security.txt file. Findings are grouped
-/// by host, in the order of `hosts`.
-pub async fn audit(client: &Client, hosts: &[&str], now: Timestamp) -> Vec<Finding> {
-    stream::iter(hosts)
-        .map(|host| check_host(client, host, now))
-        .buffered(CONCURRENT_HOSTS)
-        .collect::<Vec<_>>()
-        .await
-        .concat()
-}
-
-#[derive(Debug)]
-struct Response {
-    /// The URL after following redirects.
-    final_url: String,
-    status: u16,
-    content_type: Option<String>,
-    body: Vec<u8>,
-    truncated: bool,
-}
-
-impl Response {
-    fn is_plain_text(&self) -> bool {
-        self.content_type
-            .as_deref()
-            .and_then(|value| value.split(';').next())
-            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/plain"))
-    }
-
-    /// Many servers answer unknown paths with `200` and an HTML page, so only
-    /// a plain-text response counts as a security.txt file.
-    fn is_found(&self) -> bool {
-        self.status == 200 && self.is_plain_text()
-    }
-
-    fn describe_miss(&self) -> String {
-        if self.status != 200 {
-            format!("HTTP {}", self.status)
-        } else {
-            let content_type = self.content_type.as_deref().unwrap_or("no Content-Type");
-            format!("{content_type} instead of text/plain")
-        }
-    }
-}
-
-async fn fetch(client: &Client, url: &str) -> Result<Response, String> {
-    let mut response = client.get(url).send().await.map_err(error_chain)?;
-    let final_url = response.url().to_string();
-    let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-
-    let mut body = Vec::new();
-    let mut truncated = false;
-    if status == 200 {
-        while let Some(chunk) = response.chunk().await.map_err(error_chain)? {
-            body.extend_from_slice(&chunk);
-            if body.len() > MAX_BODY_BYTES {
-                truncated = true;
-                break;
-            }
-        }
-    }
-
-    Ok(Response {
-        final_url,
-        status,
-        content_type,
-        body,
-        truncated,
-    })
-}
-
-/// Formats the causes of a request error. reqwest's own message only repeats
-/// the URL, so it is used only when there is no underlying cause.
-fn error_chain(err: reqwest::Error) -> String {
-    let mut causes = Vec::new();
-    let mut source = err.source();
-    while let Some(cause) = source {
-        causes.push(cause.to_string());
-        source = cause.source();
-    }
-    if causes.is_empty() {
-        err.to_string()
+fn describe_miss(response: &Response) -> String {
+    if response.status != 200 {
+        format!("HTTP {}", response.status)
     } else {
-        causes.join(": ")
+        let content_type = response.content_type().unwrap_or("no Content-Type");
+        format!("{content_type} instead of text/plain")
     }
 }
 
-async fn check_host(client: &Client, host: &str, now: Timestamp) -> Vec<Finding> {
+/// Checks a host for an RFC 9116 security.txt file.
+pub async fn check_host(client: &Client, host: &str, now: Timestamp) -> Vec<Finding> {
     let well_known_url = format!("https://{host}/.well-known/security.txt");
-    let well_known = fetch(client, &well_known_url).await;
+    let well_known = fetch(client, &well_known_url, true).await;
     if let Ok(response) = &well_known
-        && response.is_found()
+        && is_found(response)
     {
         return grade(host, &well_known_url, response, now);
     }
 
     let legacy_url = format!("https://{host}/security.txt");
-    if let Ok(response) = fetch(client, &legacy_url).await
-        && response.is_found()
+    if let Ok(response) = fetch(client, &legacy_url, true).await
+        && is_found(&response)
     {
         let mut findings = vec![finding(
             host,
@@ -145,7 +46,7 @@ async fn check_host(client: &Client, host: &str, now: Timestamp) -> Vec<Finding>
     }
 
     let reason = match well_known {
-        Ok(response) => format!("{well_known_url} returned {}", response.describe_miss()),
+        Ok(response) => format!("{well_known_url} returned {}", describe_miss(&response)),
         Err(err) => format!("{well_known_url}: {err}"),
     };
     vec![finding(
@@ -179,7 +80,7 @@ fn grade(host: &str, url: &str, response: &Response, now: Timestamp) -> Vec<Find
 
     let mut findings = Vec::new();
 
-    let content_type = response.content_type.as_deref().unwrap_or_default();
+    let content_type = response.content_type().unwrap_or_default();
     let declares_utf8 = content_type.split(';').skip(1).any(|param| {
         param.split_once('=').is_some_and(|(k, v)| {
             k.trim().eq_ignore_ascii_case("charset")
@@ -331,14 +232,14 @@ mod tests {
         "2026-11-08T12:00:00Z".parse().unwrap()
     }
 
+    fn response_with(content_type: &str, body: &str) -> Response {
+        let mut response = crate::http::response(200, &[("content-type", content_type)], body);
+        response.final_url = URL.to_string();
+        response
+    }
+
     fn response(body: &str) -> Response {
-        Response {
-            final_url: URL.to_string(),
-            status: 200,
-            content_type: Some("text/plain; charset=utf-8".to_string()),
-            body: body.as_bytes().to_vec(),
-            truncated: false,
-        }
+        response_with("text/plain; charset=utf-8", body)
     }
 
     fn results(response: &Response) -> Vec<(Severity, String)> {
@@ -465,9 +366,10 @@ Canonical: https://example.com/.well-known/security.txt
 
     #[test]
     fn missing_charset_warns() {
-        let mut response =
-            response("Contact: mailto:s@example.com\nExpires: 2027-01-01T00:00:00Z\n");
-        response.content_type = Some("text/plain".to_string());
+        let response = response_with(
+            "text/plain",
+            "Contact: mailto:s@example.com\nExpires: 2027-01-01T00:00:00Z\n",
+        );
         assert_eq!(
             results(&response)[0],
             result(
@@ -503,11 +405,10 @@ Contact: mailto:not-signed@example.com
 
     #[test]
     fn html_fallback_page_is_not_found() {
-        let mut response = response("<!doctype html>");
-        response.content_type = Some("text/html; charset=utf-8".to_string());
-        assert!(!response.is_found());
+        let response = response_with("text/html; charset=utf-8", "<!doctype html>");
+        assert!(!is_found(&response));
         assert_eq!(
-            response.describe_miss(),
+            describe_miss(&response),
             "text/html; charset=utf-8 instead of text/plain"
         );
     }
