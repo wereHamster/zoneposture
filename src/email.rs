@@ -55,7 +55,7 @@ fn has_dkim(zone: &Zone, domain: &str) -> bool {
         .any(|r| dkim_domain(&r.name).as_deref() == Some(domain))
 }
 
-fn is_spf(text: &str) -> bool {
+pub(crate) fn is_spf(text: &str) -> bool {
     let Some(prefix) = text.get(..6) else {
         return false;
     };

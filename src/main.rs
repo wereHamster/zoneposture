@@ -1,9 +1,11 @@
 mod caa;
+mod dns;
 mod email;
 mod finding;
 mod headers;
 mod http;
 mod security_txt;
+mod snapshot;
 mod tls;
 mod web;
 mod zone;
@@ -32,6 +34,12 @@ enum Command {
         /// Path to the zone file, in standard BIND format
         #[arg(long, value_name = "FILE")]
         zone: PathBuf,
+    },
+    /// Look up names in DNS and write a partial zone file for `audit` to stdout
+    Snapshot {
+        /// Names to look up, which must all be in the same zone
+        #[arg(required = true, value_name = "NAME")]
+        names: Vec<String>,
     },
 }
 
@@ -77,6 +85,21 @@ async fn main() -> ExitCode {
             print_findings("Security headers", &web.headers);
             println!();
             print_findings("Vulnerability disclosure", &web.disclosure);
+
+            ExitCode::SUCCESS
+        }
+        Command::Snapshot { names } => {
+            let snapshot = match snapshot::snapshot(&dns::System::new(), &names).await {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            for warning in &snapshot.warnings {
+                eprintln!("warning: {warning}");
+            }
+            print!("{}", snapshot::render(&snapshot, Timestamp::now()));
 
             ExitCode::SUCCESS
         }
