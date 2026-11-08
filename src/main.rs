@@ -4,6 +4,7 @@ mod email;
 mod finding;
 mod headers;
 mod http;
+mod rules;
 mod security_txt;
 mod snapshot;
 mod tls;
@@ -16,7 +17,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use jiff::Timestamp;
 
-use crate::finding::Finding;
+use crate::finding::{Finding, Severity};
 use crate::http::Clients;
 use crate::zone::Zone;
 
@@ -40,6 +41,12 @@ enum Command {
         /// Names to look up, which must all be in the same zone
         #[arg(required = true, value_name = "NAME")]
         names: Vec<String>,
+    },
+    /// Explain a finding and how to fix it
+    Explain {
+        /// The finding id shown by `audit`, e.g. `caa-missing`
+        #[arg(value_name = "ID")]
+        id: String,
     },
 }
 
@@ -72,9 +79,11 @@ async fn main() -> ExitCode {
 
             print_hosts(&zone);
             println!();
-            print_findings("Email", &email::audit(&zone));
+            let email = email::audit(&zone);
+            print_findings("Email", &email);
             println!();
-            print_findings("CAA", &caa::audit(&zone));
+            let caa = caa::audit(&zone);
+            print_findings("CAA", &caa);
 
             let web = web::audit(&clients, &tls, &zone, Timestamp::now()).await;
             println!();
@@ -86,8 +95,38 @@ async fn main() -> ExitCode {
             println!();
             print_findings("Vulnerability disclosure", &web.disclosure);
 
+            let sections = [
+                &email,
+                &caa,
+                &web.https,
+                &web.certificates,
+                &web.headers,
+                &web.disclosure,
+            ];
+            if sections
+                .iter()
+                .flat_map(|findings| findings.iter())
+                .any(|finding| finding.severity >= Severity::Warn)
+            {
+                println!();
+                println!("Run `zoneposture explain <id>` to see how to fix a finding.");
+            }
+
             ExitCode::SUCCESS
         }
+        Command::Explain { id } => match rules::find(&id) {
+            Some(rule) => {
+                print!("{}", rule.docs);
+                ExitCode::SUCCESS
+            }
+            None => {
+                eprintln!("error: unknown finding id {id:?}; the known ids are:");
+                for rule in rules::ALL {
+                    eprintln!("  {}", rule.id);
+                }
+                ExitCode::FAILURE
+            }
+        },
         Command::Snapshot { names } => {
             let snapshot = match snapshot::snapshot(&dns::System::new(), &names).await {
                 Ok(snapshot) => snapshot,
@@ -122,7 +161,7 @@ fn print_hosts(zone: &Zone) {
 }
 
 fn print_findings(title: &str, findings: &[Finding]) {
-    let check_width = findings.iter().map(|f| f.check.len()).max().unwrap_or(0);
+    let id_width = findings.iter().map(|f| f.id.len()).max().unwrap_or(0);
 
     println!("{title}");
     let mut subject = None;
@@ -132,8 +171,8 @@ fn print_findings(title: &str, findings: &[Finding]) {
             println!("  {}", finding.subject);
         }
         println!(
-            "    {}  {:check_width$}  {}",
-            finding.severity, finding.check, finding.message
+            "    {}  {:id_width$}  {}",
+            finding.severity, finding.id, finding.message
         );
     }
 }

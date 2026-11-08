@@ -20,6 +20,7 @@ use x509_parser::extensions::GeneralName;
 
 use crate::caa;
 use crate::finding::{Finding, Severity};
+use crate::rules;
 use crate::zone::{RecordData, Zone, non_public_range};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -212,7 +213,7 @@ pub async fn check_host(
         Ok(_) => {
             return vec![finding(
                 host,
-                "Certificate",
+                rules::TLS_CONNECTION,
                 Severity::Fail,
                 format!("{host} has no public addresses"),
             )];
@@ -220,7 +221,7 @@ pub async fn check_host(
         Err(err) => {
             return vec![finding(
                 host,
-                "Certificate",
+                rules::TLS_CONNECTION,
                 Severity::Fail,
                 format!("cannot resolve {host}: {err}"),
             )];
@@ -335,25 +336,34 @@ fn describe_handshake_error(host: &str, err: &io::Error) -> String {
     }
 }
 
-fn finding(host: &str, check: &'static str, severity: Severity, message: String) -> Finding {
+fn finding(host: &str, id: &'static str, severity: Severity, message: String) -> Finding {
     Finding {
         subject: host.to_string(),
-        check,
+        id,
         severity,
         message,
     }
 }
 
-fn grade_outcome(host: &str, outcome: &Outcome, now: Timestamp) -> (Severity, String) {
+type Grade = (&'static str, Severity, String);
+
+fn grade_outcome(host: &str, outcome: &Outcome, now: Timestamp) -> Grade {
     match outcome {
         Outcome::NoIpv6Route => (
+            rules::TLS_CONNECTION,
             Severity::Info,
             "not checked; this machine has no IPv6 route".to_string(),
         ),
-        Outcome::ConnectFailed(err) => {
-            (Severity::Fail, format!("cannot connect to port 443: {err}"))
-        }
-        Outcome::HandshakeFailed(err) => (Severity::Fail, format!("TLS handshake failed: {err}")),
+        Outcome::ConnectFailed(err) => (
+            rules::TLS_CONNECTION,
+            Severity::Fail,
+            format!("cannot connect to port 443: {err}"),
+        ),
+        Outcome::HandshakeFailed(err) => (
+            rules::TLS_CONNECTION,
+            Severity::Fail,
+            format!("TLS handshake failed: {err}"),
+        ),
         Outcome::Certificate { info, verdict } => {
             let issuer = info.issuer();
             let date = info.not_after.strftime("%Y-%m-%d");
@@ -368,18 +378,23 @@ fn grade_outcome(host: &str, outcome: &Outcome, now: Timestamp) -> (Severity, St
                         Severity::Pass
                     };
                     (
+                        rules::CERTIFICATE_VALIDITY_PERIOD,
                         severity,
                         format!("valid; issued by {issuer}, expires {date} (in {days} days)"),
                     )
                 }
                 Verdict::Expired => (
+                    rules::CERTIFICATE_VALIDITY_PERIOD,
                     Severity::Fail,
                     format!("expired on {date}; issued by {issuer}"),
                 ),
-                Verdict::NotYetValid => {
-                    (Severity::Fail, format!("not valid yet; issued by {issuer}"))
-                }
+                Verdict::NotYetValid => (
+                    rules::CERTIFICATE_VALIDITY_PERIOD,
+                    Severity::Fail,
+                    format!("not valid yet; issued by {issuer}"),
+                ),
                 Verdict::WrongName => (
+                    rules::CERTIFICATE_HOSTNAME,
                     Severity::Fail,
                     format!(
                         "not valid for {host}; it covers {}",
@@ -387,12 +402,17 @@ fn grade_outcome(host: &str, outcome: &Outcome, now: Timestamp) -> (Severity, St
                     ),
                 ),
                 Verdict::UnknownIssuer => (
+                    rules::CERTIFICATE_TRUST,
                     Severity::Fail,
                     format!(
                         "chain does not lead to a trusted root; issued by {issuer}. The server may not send its intermediate certificates"
                     ),
                 ),
-                Verdict::Invalid(err) => (Severity::Fail, format!("invalid: {err}")),
+                Verdict::Invalid(err) => (
+                    rules::CERTIFICATE_TRUST,
+                    Severity::Fail,
+                    format!("invalid: {err}"),
+                ),
             }
         }
     }
@@ -413,29 +433,19 @@ fn grade_addresses(host: &str, outcomes: &[(IpAddr, Outcome)], now: Timestamp) -
     let (untested, tested): (Vec<_>, Vec<_>) = outcomes
         .iter()
         .map(|(addr, outcome)| (addr, grade_outcome(host, outcome, now)))
-        .partition(|(_, (severity, _))| *severity == Severity::Info);
+        .partition(|(_, (_, severity, _))| *severity == Severity::Info);
 
     let mut findings = Vec::new();
     let all_same = tested.windows(2).all(|pair| pair[0].1 == pair[1].1);
-    if all_same && let Some((_, (severity, message))) = tested.first() {
-        findings.push(finding(host, "Certificate", *severity, message.clone()));
+    if all_same && let Some((_, (id, severity, message))) = tested.first() {
+        findings.push(finding(host, id, *severity, message.clone()));
     } else {
-        for (addr, (severity, message)) in &tested {
-            findings.push(finding(
-                host,
-                "Certificate",
-                *severity,
-                format!("{addr}: {message}"),
-            ));
+        for (addr, (id, severity, message)) in &tested {
+            findings.push(finding(host, id, *severity, format!("{addr}: {message}")));
         }
     }
-    for (addr, (severity, message)) in untested {
-        findings.push(finding(
-            host,
-            "Certificate",
-            severity,
-            format!("{addr}: {message}"),
-        ));
+    for (addr, (id, severity, message)) in untested {
+        findings.push(finding(host, id, severity, format!("{addr}: {message}")));
     }
     findings
 }
@@ -521,7 +531,7 @@ fn check_caa(zone: &Zone, host: &str, outcomes: &[(IpAddr, Outcome)]) -> Vec<Fin
                 &allowed,
                 cname_target,
             );
-            Some(finding(host, "CAA", severity, message))
+            Some(finding(host, rules::CERTIFICATE_CAA, severity, message))
         })
         .collect()
 }
@@ -602,7 +612,49 @@ mod tests {
     }
 
     fn grade(outcome: Outcome) -> (Severity, String) {
-        grade_outcome("example.com", &outcome, now())
+        let (_, severity, message) = grade_outcome("example.com", &outcome, now());
+        (severity, message)
+    }
+
+    #[test]
+    fn outcomes_map_to_rules() {
+        for (outcome, id) in [
+            (Outcome::NoIpv6Route, "tls-connection"),
+            (
+                Outcome::ConnectFailed("refused".to_string()),
+                "tls-connection",
+            ),
+            (
+                Outcome::HandshakeFailed("timed out".to_string()),
+                "tls-connection",
+            ),
+            (
+                certificate("2027-01-30T00:00:00Z", Verdict::Valid),
+                "certificate-validity-period",
+            ),
+            (
+                certificate("2026-10-01T00:00:00Z", Verdict::Expired),
+                "certificate-validity-period",
+            ),
+            (
+                certificate("2027-01-30T00:00:00Z", Verdict::NotYetValid),
+                "certificate-validity-period",
+            ),
+            (
+                certificate("2027-01-30T00:00:00Z", Verdict::WrongName),
+                "certificate-hostname",
+            ),
+            (
+                certificate("2027-01-30T00:00:00Z", Verdict::UnknownIssuer),
+                "certificate-trust",
+            ),
+            (
+                certificate("2027-01-30T00:00:00Z", Verdict::Invalid("bad".to_string())),
+                "certificate-trust",
+            ),
+        ] {
+            assert_eq!(grade_outcome("example.com", &outcome, now()).0, id);
+        }
     }
 
     #[test]

@@ -3,8 +3,8 @@ use reqwest::Client;
 
 use crate::finding::{Finding, Severity};
 use crate::http::{MAX_BODY_BYTES, Response, fetch};
+use crate::rules;
 
-const CHECK: &str = "security.txt";
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
 /// Many servers answer unknown paths with `200` and an HTML page, so only a
@@ -38,6 +38,7 @@ pub async fn check_host(client: &Client, host: &str, now: Timestamp) -> Vec<Find
     {
         let mut findings = vec![finding(
             host,
+            rules::SECURITY_TXT_LOCATION,
             Severity::Warn,
             format!("found only at {legacy_url}; serve it at /.well-known/security.txt"),
         )];
@@ -51,31 +52,37 @@ pub async fn check_host(client: &Client, host: &str, now: Timestamp) -> Vec<Find
     };
     vec![finding(
         host,
+        rules::SECURITY_TXT_MISSING,
         Severity::Fail,
         format!("no security.txt; {reason}"),
     )]
 }
 
-fn finding(host: &str, severity: Severity, message: String) -> Finding {
+fn finding(host: &str, id: &'static str, severity: Severity, message: String) -> Finding {
     Finding {
         subject: host.to_string(),
-        check: CHECK,
+        id,
         severity,
         message,
     }
 }
 
 fn grade(host: &str, url: &str, response: &Response, now: Timestamp) -> Vec<Finding> {
-    let result = |severity, message| finding(host, severity, message);
+    let result = |id, severity, message| finding(host, id, severity, message);
 
     if response.truncated {
         return vec![result(
+            rules::SECURITY_TXT_FORMAT,
             Severity::Fail,
             format!("{url} is larger than {} KiB", MAX_BODY_BYTES / 1024),
         )];
     }
     let Ok(text) = std::str::from_utf8(&response.body) else {
-        return vec![result(Severity::Fail, format!("{url} is not valid UTF-8"))];
+        return vec![result(
+            rules::SECURITY_TXT_FORMAT,
+            Severity::Fail,
+            format!("{url} is not valid UTF-8"),
+        )];
     };
 
     let mut findings = Vec::new();
@@ -89,6 +96,7 @@ fn grade(host: &str, url: &str, response: &Response, now: Timestamp) -> Vec<Find
     });
     if !declares_utf8 {
         findings.push(result(
+            rules::SECURITY_TXT_FORMAT,
             Severity::Warn,
             format!("Content-Type {content_type:?} does not declare charset=utf-8"),
         ));
@@ -105,25 +113,32 @@ fn grade(host: &str, url: &str, response: &Response, now: Timestamp) -> Vec<Find
 
     let contacts = values("contact");
     if contacts.is_empty() {
-        findings.push(result(Severity::Fail, "no Contact field".to_string()));
+        findings.push(result(
+            rules::SECURITY_TXT_CONTACT,
+            Severity::Fail,
+            "no Contact field".to_string(),
+        ));
     } else {
         for contact in &contacts {
             match contact.split_once(':').map(|(scheme, _)| scheme) {
                 Some(scheme) if is_uri_scheme(scheme) => {
                     if scheme.eq_ignore_ascii_case("http") {
                         findings.push(result(
+                            rules::SECURITY_TXT_CONTACT,
                             Severity::Fail,
                             format!("Contact {contact} must use https"),
                         ));
                     }
                 }
                 _ => findings.push(result(
+                    rules::SECURITY_TXT_CONTACT,
                     Severity::Fail,
                     format!("Contact value {contact:?} is not a URI"),
                 )),
             }
         }
         findings.push(result(
+            rules::SECURITY_TXT_CONTACT,
             Severity::Pass,
             format!("Contact: {}", contacts.join(", ")),
         ));
@@ -138,6 +153,7 @@ fn grade(host: &str, url: &str, response: &Response, now: Timestamp) -> Vec<Find
             .any(|value| *value == url || *value == response.final_url)
     {
         findings.push(result(
+            rules::SECURITY_TXT_CANONICAL,
             Severity::Warn,
             format!("Canonical does not list {url}"),
         ));
@@ -147,7 +163,7 @@ fn grade(host: &str, url: &str, response: &Response, now: Timestamp) -> Vec<Find
 }
 
 fn check_expires(host: &str, values: &[&str], now: Timestamp) -> Finding {
-    let result = |severity, message| finding(host, severity, message);
+    let result = |severity, message| finding(host, rules::SECURITY_TXT_EXPIRES, severity, message);
 
     let value = match values {
         [value] => *value,
@@ -251,6 +267,31 @@ mod tests {
 
     fn result(severity: Severity, message: &str) -> (Severity, String) {
         (severity, message.to_string())
+    }
+
+    #[test]
+    fn findings_carry_the_id_of_their_rule() {
+        let response = response_with(
+            "text/plain",
+            "Contact: security@example.com
+Expires: 2027-06-30T23:00:00Z
+Canonical: https://other.example/security.txt
+",
+        );
+        let ids: Vec<&str> = grade("example.com", URL, &response, now())
+            .iter()
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "security-txt-format",
+                "security-txt-contact",
+                "security-txt-contact",
+                "security-txt-expires",
+                "security-txt-canonical",
+            ]
+        );
     }
 
     #[test]

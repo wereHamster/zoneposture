@@ -23,7 +23,8 @@ impl fmt::Display for Severity {
 pub struct Finding {
     /// The domain name the finding is about.
     pub subject: String,
-    pub check: &'static str,
+    /// The id of the [`Rule`](crate::rules::Rule) that produced the finding.
+    pub id: &'static str,
     pub severity: Severity,
     pub message: String,
 }

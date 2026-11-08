@@ -5,6 +5,7 @@ use reqwest::header::{
 
 use crate::finding::{Finding, Severity};
 use crate::http::Response;
+use crate::rules;
 
 const ONE_YEAR_SECONDS: u64 = 365 * 24 * 60 * 60;
 
@@ -25,7 +26,7 @@ pub fn grade(host: &str, is_apex: bool, response: &Response) -> Vec<Finding> {
     } else {
         findings.push(finding(
             host,
-            "CSP",
+            rules::CSP_ENFORCED,
             Severity::Pass,
             format!(
                 "{} is {}, not HTML; CSP and framing checks do not apply",
@@ -38,10 +39,10 @@ pub fn grade(host: &str, is_apex: bool, response: &Response) -> Vec<Finding> {
     findings
 }
 
-fn finding(host: &str, check: &'static str, severity: Severity, message: String) -> Finding {
+fn finding(host: &str, id: &'static str, severity: Severity, message: String) -> Finding {
     Finding {
         subject: host.to_string(),
-        check,
+        id,
         severity,
         message,
     }
@@ -55,7 +56,7 @@ fn header_values<'a>(headers: &'a HeaderMap, name: &HeaderName) -> impl Iterator
 }
 
 fn check_hsts(host: &str, is_apex: bool, headers: &HeaderMap) -> Vec<Finding> {
-    let hsts = |severity, message| finding(host, "HSTS", severity, message);
+    let hsts = |severity, message| finding(host, rules::HSTS_POLICY, severity, message);
 
     // Browsers only process the first Strict-Transport-Security header.
     let Some(value) = header_values(headers, &STRICT_TRANSPORT_SECURITY).next() else {
@@ -114,7 +115,9 @@ fn check_hsts(host: &str, is_apex: bool, headers: &HeaderMap) -> Vec<Finding> {
         hsts(Severity::Pass, summary)
     }];
     if is_apex && !include_subdomains {
-        findings.push(hsts(
+        findings.push(finding(
+            host,
+            rules::HSTS_INCLUDE_SUBDOMAINS,
             Severity::Warn,
             "no includeSubDomains; subdomains are not covered".to_string(),
         ));
@@ -194,7 +197,9 @@ const SCRIPT_WEAKNESSES: &[(&str, &str)] = &[
 ];
 
 fn check_csp(host: &str, headers: &HeaderMap, policies: &[Policy]) -> Vec<Finding> {
-    let csp = |severity, message| finding(host, "CSP", severity, message);
+    let enforced = |severity, message| finding(host, rules::CSP_ENFORCED, severity, message);
+    let script_src = |severity, message| finding(host, rules::CSP_SCRIPT_SRC, severity, message);
+    let object_src = |severity, message| finding(host, rules::CSP_OBJECT_SRC, severity, message);
 
     if policies.is_empty() {
         return vec![
@@ -202,13 +207,13 @@ fn check_csp(host: &str, headers: &HeaderMap, policies: &[Policy]) -> Vec<Findin
                 .next()
                 .is_some()
             {
-                csp(
+                enforced(
                     Severity::Warn,
                     "only Content-Security-Policy-Report-Only is sent; nothing is enforced"
                         .to_string(),
                 )
             } else {
-                csp(
+                enforced(
                     Severity::Fail,
                     "no Content-Security-Policy header".to_string(),
                 )
@@ -230,12 +235,15 @@ fn check_csp(host: &str, headers: &HeaderMap, policies: &[Policy]) -> Vec<Findin
         .collect();
 
     match script_policies.first() {
-        None => findings.push(csp(
+        None => findings.push(script_src(
             Severity::Warn,
             "does not restrict scripts; no script-src or default-src".to_string(),
         )),
         Some((name, sources)) => {
-            findings.push(csp(Severity::Pass, format!("{name} {}", sources.join(" "))));
+            findings.push(script_src(
+                Severity::Pass,
+                format!("{name} {}", sources.join(" ")),
+            ));
             // With several policies, a script must pass all of them, so a
             // weakness only matters if every policy has it.
             for (weakness, consequence) in SCRIPT_WEAKNESSES {
@@ -243,7 +251,7 @@ fn check_csp(host: &str, headers: &HeaderMap, policies: &[Policy]) -> Vec<Findin
                     .iter()
                     .all(|(_, sources)| script_source_weakness(sources, weakness))
                 {
-                    findings.push(csp(
+                    findings.push(script_src(
                         Severity::Warn,
                         format!("{name} allows {weakness}; {consequence}"),
                     ));
@@ -256,7 +264,7 @@ fn check_csp(host: &str, headers: &HeaderMap, policies: &[Policy]) -> Vec<Findin
         directive(policy, "object-src").is_some() || directive(policy, "default-src").is_some()
     });
     if !restricts_objects {
-        findings.push(csp(
+        findings.push(object_src(
             Severity::Warn,
             "no object-src or default-src; <object> and <embed> are unrestricted".to_string(),
         ));
@@ -266,7 +274,7 @@ fn check_csp(host: &str, headers: &HeaderMap, policies: &[Policy]) -> Vec<Findin
 }
 
 fn check_framing(host: &str, headers: &HeaderMap, policies: &[Policy]) -> Finding {
-    let framing = |severity, message| finding(host, "Framing", severity, message);
+    let framing = |severity, message| finding(host, rules::CSP_FRAME_ANCESTORS, severity, message);
 
     let frame_ancestors: Vec<&[String]> = policies
         .iter()
@@ -322,19 +330,30 @@ mod tests {
         "default-src 'self'; frame-ancestors 'none'",
     );
 
+    const HSTS_IDS: &[&str] = &["hsts-policy", "hsts-include-subdomains"];
+    const CSP_IDS: &[&str] = &["csp-enforced", "csp-script-src", "csp-object-src"];
+    const FRAMING_IDS: &[&str] = &["csp-frame-ancestors"];
+
     fn results(is_apex: bool, headers: &[(&str, &str)]) -> Vec<(&'static str, Severity, String)> {
         grade("example.com", is_apex, &response(200, headers, ""))
             .into_iter()
-            .map(|f| (f.check, f.severity, f.message))
+            .map(|f| (f.id, f.severity, f.message))
             .collect()
     }
 
-    fn check(results: &[(&'static str, Severity, String)], check: &str) -> Vec<(Severity, String)> {
+    fn check(
+        results: &[(&'static str, Severity, String)],
+        ids: &[&str],
+    ) -> Vec<(Severity, String)> {
         results
             .iter()
-            .filter(|(c, _, _)| *c == check)
+            .filter(|(id, _, _)| ids.contains(id))
             .map(|(_, severity, message)| (*severity, message.clone()))
             .collect()
+    }
+
+    fn ids(results: &[(&'static str, Severity, String)]) -> Vec<&'static str> {
+        results.iter().map(|(id, _, _)| *id).collect()
     }
 
     fn result(severity: Severity, message: &str) -> (Severity, String) {
@@ -347,13 +366,17 @@ mod tests {
             results(true, &[HTML, HSTS, CSP]),
             [
                 (
-                    "HSTS",
+                    "hsts-policy",
                     Severity::Pass,
                     "max-age=63072000; includeSubDomains; preload".to_string()
                 ),
-                ("CSP", Severity::Pass, "default-src 'self'".to_string()),
                 (
-                    "Framing",
+                    "csp-script-src",
+                    Severity::Pass,
+                    "default-src 'self'".to_string()
+                ),
+                (
+                    "csp-frame-ancestors",
                     Severity::Pass,
                     "frame-ancestors 'none'".to_string()
                 ),
@@ -418,7 +441,7 @@ mod tests {
                 headers.push(("strict-transport-security", value));
             }
             assert_eq!(
-                check(&results(is_apex, &headers), "HSTS"),
+                check(&results(is_apex, &headers), HSTS_IDS),
                 expected,
                 "{value:?}"
             );
@@ -428,7 +451,7 @@ mod tests {
     #[test]
     fn missing_and_report_only_csp() {
         assert_eq!(
-            check(&results(false, &[HTML, HSTS]), "CSP"),
+            check(&results(false, &[HTML, HSTS]), CSP_IDS),
             [result(Severity::Fail, "no Content-Security-Policy header")]
         );
         assert_eq!(
@@ -441,7 +464,7 @@ mod tests {
                         ("content-security-policy-report-only", "default-src 'self'")
                     ]
                 ),
-                "CSP"
+                CSP_IDS
             ),
             [result(
                 Severity::Warn,
@@ -464,7 +487,20 @@ mod tests {
             ],
         );
         assert_eq!(
-            check(&findings, "CSP"),
+            ids(&findings),
+            [
+                "hsts-policy",
+                "csp-script-src",
+                "csp-script-src",
+                "csp-script-src",
+                "csp-script-src",
+                "csp-script-src",
+                "csp-object-src",
+                "csp-frame-ancestors",
+            ]
+        );
+        assert_eq!(
+            check(&findings, CSP_IDS),
             [
                 result(
                     Severity::Pass,
@@ -507,7 +543,7 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(check(&findings, "CSP").len(), 1, "{findings:?}");
+        assert_eq!(check(&findings, CSP_IDS).len(), 1, "{findings:?}");
     }
 
     #[test]
@@ -528,7 +564,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            check(&findings, "CSP"),
+            check(&findings, CSP_IDS),
             [result(Severity::Pass, "default-src 'self' 'unsafe-inline'")]
         );
     }
@@ -540,7 +576,7 @@ mod tests {
             &[HTML, HSTS, ("content-security-policy", "img-src 'self'")],
         );
         assert_eq!(
-            check(&findings, "CSP")[0],
+            check(&findings, CSP_IDS)[0],
             result(
                 Severity::Warn,
                 "does not restrict scripts; no script-src or default-src"
@@ -598,7 +634,7 @@ mod tests {
             let mut all = vec![HTML, HSTS];
             all.extend(headers.iter().copied());
             assert_eq!(
-                check(&results(false, &all), "Framing"),
+                check(&results(false, &all), FRAMING_IDS),
                 [expected],
                 "{headers:?}"
             );
@@ -611,12 +647,12 @@ mod tests {
             results(false, &[("content-type", "application/json"), HSTS]),
             [
                 (
-                    "HSTS",
+                    "hsts-policy",
                     Severity::Pass,
                     "max-age=63072000; includeSubDomains; preload".to_string()
                 ),
                 (
-                    "CSP",
+                    "csp-enforced",
                     Severity::Pass,
                     "https://example.com/ is application/json, not HTML; CSP and framing checks do not apply"
                         .to_string()

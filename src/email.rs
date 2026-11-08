@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::finding::{Finding, Severity};
+use crate::rules;
 use crate::zone::{RecordData, Zone};
 
 /// Returns the zone's mail domains: the apex, plus every name that has MX or
@@ -62,17 +63,17 @@ pub(crate) fn is_spf(text: &str) -> bool {
     prefix.eq_ignore_ascii_case("v=spf1") && text[6..].chars().next().is_none_or(|c| c == ' ')
 }
 
-fn finding(subject: &str, check: &'static str, severity: Severity, message: String) -> Finding {
+fn finding(subject: &str, id: &'static str, severity: Severity, message: String) -> Finding {
     Finding {
         subject: subject.to_string(),
-        check,
+        id,
         severity,
         message,
     }
 }
 
 fn check_spf(zone: &Zone, domain: &str) -> Vec<Finding> {
-    let spf = |severity, message| vec![finding(domain, "SPF", severity, message)];
+    let spf = |id, severity, message| vec![finding(domain, id, severity, message)];
     let records: Vec<&str> = zone.txt_at(domain).filter(|text| is_spf(text)).collect();
 
     let record = match records.as_slice() {
@@ -87,10 +88,11 @@ fn check_spf(zone: &Zone, domain: &str) -> Vec<Finding> {
             } else {
                 format!("no SPF record; publish \"v=spf1 -all\" if {domain} sends no mail")
             };
-            return spf(Severity::Fail, message);
+            return spf(rules::SPF_RECORD, Severity::Fail, message);
         }
         _ => {
             return spf(
+                rules::SPF_RECORD,
                 Severity::Fail,
                 format!(
                     "{} SPF records; receivers treat this as a permanent error",
@@ -143,7 +145,7 @@ fn check_spf(zone: &Zone, domain: &str) -> Vec<Finding> {
             "has no all mechanism; unauthorized mail defaults to neutral".to_string(),
         ),
     };
-    spf(severity, format!("\"{record}\" {verdict}"))
+    spf(rules::SPF_ALL, severity, format!("\"{record}\" {verdict}"))
 }
 
 #[derive(Debug)]
@@ -213,19 +215,21 @@ fn grade_policy(policy: &str) -> (Severity, &'static str) {
 }
 
 fn check_dmarc(zone: &Zone, domain: &str) -> Vec<Finding> {
-    let dmarc = |severity, message| finding(domain, "DMARC", severity, message);
+    let dmarc = |id, severity, message| finding(domain, id, severity, message);
     let name = format!("_dmarc.{domain}");
 
     let tags = match lookup_dmarc(zone, domain) {
         DmarcLookup::Record(tags) => tags,
         DmarcLookup::Multiple(n) => {
             return vec![dmarc(
+                rules::DMARC_RECORD,
                 Severity::Fail,
                 format!("{n} DMARC records at {name}; receivers ignore all of them"),
             )];
         }
         DmarcLookup::Delegated(target) => {
             return vec![dmarc(
+                rules::DMARC_RECORD,
                 Severity::Warn,
                 format!("{name} is a CNAME to {target}, which is not evaluated"),
             )];
@@ -234,25 +238,35 @@ fn check_dmarc(zone: &Zone, domain: &str) -> Vec<Finding> {
             return vec![inherited_dmarc(zone, domain)];
         }
         DmarcLookup::Missing => {
-            return vec![dmarc(Severity::Fail, format!("no DMARC record at {name}"))];
+            return vec![dmarc(
+                rules::DMARC_RECORD,
+                Severity::Fail,
+                format!("no DMARC record at {name}"),
+            )];
         }
     };
 
     let Some(policy) = tag(&tags, "p") else {
         return vec![dmarc(
+            rules::DMARC_POLICY,
             Severity::Fail,
             format!("record at {name} has no p= tag"),
         )];
     };
 
     let (severity, note) = grade_policy(policy);
-    let mut findings = vec![dmarc(severity, format!("p={policy}{note}"))];
+    let mut findings = vec![dmarc(
+        rules::DMARC_POLICY,
+        severity,
+        format!("p={policy}{note}"),
+    )];
 
     if domain == zone.apex
         && let Some(subdomain_policy) = tag(&tags, "sp")
         && policy_strength(subdomain_policy) < policy_strength(policy)
     {
         findings.push(dmarc(
+            rules::DMARC_POLICY,
             Severity::Warn,
             format!("sp={subdomain_policy} is weaker than p={policy} for subdomains"),
         ));
@@ -262,6 +276,7 @@ fn check_dmarc(zone: &Zone, domain: &str) -> Vec<Finding> {
         && pct.parse::<u8>().is_ok_and(|pct| pct < 100)
     {
         findings.push(dmarc(
+            rules::DMARC_PCT,
             Severity::Warn,
             format!("pct={pct} applies the policy to only {pct}% of failing mail"),
         ));
@@ -269,6 +284,7 @@ fn check_dmarc(zone: &Zone, domain: &str) -> Vec<Finding> {
 
     if tag(&tags, "rua").is_none() {
         findings.push(dmarc(
+            rules::DMARC_RUA,
             Severity::Warn,
             "no rua= tag; no aggregate reports are sent".to_string(),
         ));
@@ -281,7 +297,7 @@ fn check_dmarc(zone: &Zone, domain: &str) -> Vec<Finding> {
 // subdomains without a record of their own.
 fn inherited_dmarc(zone: &Zone, domain: &str) -> Finding {
     let apex_name = format!("_dmarc.{}", zone.apex);
-    let (severity, message) = match lookup_dmarc(zone, &zone.apex) {
+    let (id, severity, message) = match lookup_dmarc(zone, &zone.apex) {
         DmarcLookup::Record(tags) => {
             let inherited = tag(&tags, "sp")
                 .map(|sp| ("sp", sp))
@@ -290,26 +306,30 @@ fn inherited_dmarc(zone: &Zone, domain: &str) -> Finding {
                 Some((key, policy)) => {
                     let (severity, note) = grade_policy(policy);
                     (
+                        rules::DMARC_POLICY,
                         severity,
                         format!("inherits {key}={policy} from {apex_name}{note}"),
                     )
                 }
                 None => (
+                    rules::DMARC_POLICY,
                     Severity::Fail,
                     format!("no record of its own, and {apex_name} has no p= tag"),
                 ),
             }
         }
         DmarcLookup::Delegated(_) => (
+            rules::DMARC_RECORD,
             Severity::Warn,
             format!("no record of its own; inherits from {apex_name}, which is not evaluated"),
         ),
         DmarcLookup::Missing | DmarcLookup::Multiple(_) => (
+            rules::DMARC_RECORD,
             Severity::Fail,
             format!("no DMARC record at _dmarc.{domain} or {apex_name}"),
         ),
     };
-    finding(domain, "DMARC", severity, message)
+    finding(domain, id, severity, message)
 }
 
 #[cfg(test)]
@@ -327,16 +347,32 @@ mod tests {
     fn results(zone: &Zone) -> Vec<(String, &'static str, Severity)> {
         audit(zone)
             .into_iter()
-            .map(|f| (f.subject, f.check, f.severity))
+            .map(|f| (f.subject, f.id, f.severity))
             .collect()
     }
 
-    fn messages(zone: &Zone, check: &str) -> Vec<String> {
+    fn messages(zone: &Zone, id_prefix: &str) -> Vec<String> {
         audit(zone)
             .into_iter()
-            .filter(|f| f.check == check)
+            .filter(|f| f.id.starts_with(id_prefix))
             .map(|f| f.message)
             .collect()
+    }
+
+    #[test]
+    fn findings_carry_the_id_of_their_rule() {
+        let zone = zone("_dmarc TXT \"v=DMARC1; p=reject; sp=none; pct=50\"\n");
+        let ids: Vec<&str> = audit(&zone).iter().map(|f| f.id).collect();
+        assert_eq!(
+            ids,
+            [
+                "spf-record",
+                "dmarc-policy",
+                "dmarc-policy",
+                "dmarc-pct",
+                "dmarc-rua"
+            ]
+        );
     }
 
     #[test]
@@ -379,16 +415,17 @@ www            A     192.0.2.1
             let spf = check_spf(&zone, "example.com");
             assert_eq!(spf.len(), 1, "{record}");
             assert_eq!(spf[0].severity, severity, "{record}");
+            assert_eq!(spf[0].id, "spf-all", "{record}");
         }
     }
 
     #[test]
     fn spf_missing_suggests_null_record_for_non_sending_domain() {
         let without_mx = zone("");
-        assert!(messages(&without_mx, "SPF")[0].contains("v=spf1 -all"));
+        assert!(messages(&without_mx, "spf")[0].contains("v=spf1 -all"));
 
         let with_mx = zone("@ MX 10 mx.example.net.\n");
-        assert_eq!(messages(&with_mx, "SPF"), ["no SPF record"]);
+        assert_eq!(messages(&with_mx, "spf"), ["no SPF record"]);
     }
 
     #[test]
@@ -396,6 +433,7 @@ www            A     192.0.2.1
         let zone = zone("@ TXT \"v=spf1 -all\"\n@ TXT \"v=spf1 mx -all\"\n");
         let spf = check_spf(&zone, "example.com");
         assert_eq!(spf[0].severity, Severity::Fail);
+        assert_eq!(spf[0].id, "spf-record");
         assert!(spf[0].message.contains("2 SPF records"));
     }
 
@@ -428,7 +466,7 @@ www            A     192.0.2.1
     fn dmarc_warnings() {
         let zone = zone("_dmarc TXT \"v=DMARC1; p=reject; sp=none; pct=50\"\n");
         assert_eq!(
-            messages(&zone, "DMARC"),
+            messages(&zone, "dmarc"),
             [
                 "p=reject",
                 "sp=none is weaker than p=reject for subdomains",
@@ -443,14 +481,14 @@ www            A     192.0.2.1
         let zone = zone(
             "_dmarc TXT \"p=none\"\n_dmarc TXT \"v=DMARC1; p=reject; rua=mailto:d@example.com\"\n",
         );
-        assert_eq!(messages(&zone, "DMARC"), ["p=reject"]);
+        assert_eq!(messages(&zone, "dmarc"), ["p=reject"]);
     }
 
     #[test]
     fn dmarc_multiple_records_fail() {
         let zone = zone("_dmarc TXT \"v=DMARC1; p=reject\"\n_dmarc TXT \"v=DMARC1; p=none\"\n");
         assert_eq!(
-            messages(&zone, "DMARC"),
+            messages(&zone, "dmarc"),
             ["2 DMARC records at _dmarc.example.com; receivers ignore all of them"]
         );
     }
@@ -460,7 +498,7 @@ www            A     192.0.2.1
         let zone = zone("_dmarc CNAME dmarc.example.net.\n");
         assert_eq!(
             results(&zone)[1],
-            ("example.com".into(), "DMARC", Severity::Warn)
+            ("example.com".into(), "dmarc-record", Severity::Warn)
         );
     }
 
@@ -474,9 +512,10 @@ mail TXT \"v=spf1 mx -all\"
         );
         let dmarc: Vec<_> = audit(&zone)
             .into_iter()
-            .filter(|f| f.subject == "mail.example.com" && f.check == "DMARC")
+            .filter(|f| f.subject == "mail.example.com" && f.id.starts_with("dmarc"))
             .collect();
         assert_eq!(dmarc.len(), 1);
+        assert_eq!(dmarc[0].id, "dmarc-policy");
         assert_eq!(dmarc[0].severity, Severity::Fail);
         assert!(
             dmarc[0]
@@ -489,7 +528,7 @@ mail TXT \"v=spf1 mx -all\"
     fn subdomain_without_any_dmarc_fails() {
         let zone = zone("mail MX 10 mx.example.net.\n");
         assert!(
-            messages(&zone, "DMARC").contains(
+            messages(&zone, "dmarc").contains(
                 &"no DMARC record at _dmarc.mail.example.com or _dmarc.example.com".into()
             )
         );

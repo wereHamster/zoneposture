@@ -6,6 +6,7 @@ use reqwest::header::LOCATION;
 use crate::finding::{Finding, Severity};
 use crate::headers;
 use crate::http::{Clients, Response, fetch};
+use crate::rules;
 use crate::security_txt;
 use crate::tls;
 use crate::zone::{Skip, Zone};
@@ -50,10 +51,10 @@ pub async fn audit(clients: &Clients, tls: &tls::Context, zone: &Zone, now: Time
     report
 }
 
-fn finding(host: &str, severity: Severity, message: String) -> Finding {
+fn finding(host: &str, id: &'static str, severity: Severity, message: String) -> Finding {
     Finding {
         subject: host.to_string(),
-        check: "HTTPS",
+        id,
         severity,
         message,
     }
@@ -63,6 +64,7 @@ fn skipped(host: &str, skip: &Skip, apex: &str) -> Finding {
     match skip {
         Skip::Wildcard => finding(
             host,
+            rules::DNS_WILDCARD,
             Severity::Info,
             "wildcard name; not probed".to_string(),
         ),
@@ -78,6 +80,7 @@ fn skipped(host: &str, skip: &Skip, apex: &str) -> Finding {
             };
             finding(
                 host,
+                rules::DNS_NON_PUBLIC_ADDRESS,
                 Severity::Warn,
                 format!(
                     "not probed: only non-public addresses {}; {consequence}",
@@ -105,7 +108,12 @@ async fn audit_host(
     match root {
         Err(err) => Report {
             https: vec![
-                finding(host, Severity::Fail, format!("{url}: {err}")),
+                finding(
+                    host,
+                    rules::HTTPS_UNREACHABLE,
+                    Severity::Fail,
+                    format!("{url}: {err}"),
+                ),
                 redirect,
             ],
             certificates,
@@ -135,6 +143,7 @@ async fn check_http_redirect(clients: &Clients, host: &str) -> Finding {
             Err(err) if url == start => {
                 return finding(
                     host,
+                    rules::HTTPS_REDIRECT,
                     Severity::Pass,
                     format!("{start} is not served ({err})"),
                 );
@@ -142,6 +151,7 @@ async fn check_http_redirect(clients: &Clients, host: &str) -> Finding {
             Err(err) => {
                 return finding(
                     host,
+                    rules::HTTPS_REDIRECT,
                     Severity::Fail,
                     format!("{start} redirects to {url}, which fails ({err})"),
                 );
@@ -155,6 +165,7 @@ async fn check_http_redirect(clients: &Clients, host: &str) -> Finding {
 
     finding(
         host,
+        rules::HTTPS_REDIRECT,
         Severity::Fail,
         format!("{start} redirects more than {MAX_HTTP_REDIRECTS} times without reaching HTTPS"),
     )
@@ -176,6 +187,7 @@ fn classify_http_response(host: &str, start: &str, url: &str, response: &Respons
         };
         return Hop::Done(finding(
             host,
+            rules::HTTPS_REDIRECT,
             severity,
             format!("{served_at} {what} (HTTP {status}) instead of redirecting to HTTPS"),
         ));
@@ -189,6 +201,7 @@ fn classify_http_response(host: &str, start: &str, url: &str, response: &Respons
     let Some(target) = target else {
         return Hop::Done(finding(
             host,
+            rules::HTTPS_REDIRECT,
             Severity::Fail,
             format!("{served_at} returns HTTP {status} without a valid Location header"),
         ));
@@ -197,12 +210,14 @@ fn classify_http_response(host: &str, start: &str, url: &str, response: &Respons
     match target.scheme() {
         "https" => Hop::Done(finding(
             host,
+            rules::HTTPS_REDIRECT,
             Severity::Pass,
             format!("{start} redirects to {target}"),
         )),
         "http" => Hop::Follow(target.to_string()),
         scheme => Hop::Done(finding(
             host,
+            rules::HTTPS_REDIRECT,
             Severity::Fail,
             format!("{served_at} redirects to a {scheme}: URL instead of HTTPS"),
         )),
@@ -246,6 +261,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn skipped_hosts_carry_the_id_of_their_rule() {
+        assert_eq!(
+            skipped("dev.example.com", &Skip::Wildcard, "example.com").id,
+            "dns-wildcard"
+        );
+        let non_public = Skip::NonPublic(vec![("10.0.0.1".parse().unwrap(), "private")]);
+        assert_eq!(
+            skipped("dev.example.com", &non_public, "example.com").id,
+            "dns-non-public-address"
+        );
+    }
+
     const START: &str = "http://example.com/";
 
     fn classify(
@@ -256,6 +284,27 @@ mod tests {
         match classify_http_response("example.com", START, url, &response(status, headers, "")) {
             Hop::Done(finding) => Ok((finding.severity, finding.message)),
             Hop::Follow(next) => Err(next),
+        }
+    }
+
+    #[test]
+    fn http_responses_carry_the_redirect_id() {
+        for (status, headers) in [
+            (301, vec![("location", "https://example.com/")]),
+            (200, vec![]),
+            (404, vec![]),
+            (302, vec![]),
+            (302, vec![("location", "ftp://example.com/")]),
+        ] {
+            let Hop::Done(finding) = classify_http_response(
+                "example.com",
+                START,
+                START,
+                &response(status, &headers, ""),
+            ) else {
+                panic!("{status} {headers:?} was followed");
+            };
+            assert_eq!(finding.id, "https-redirect", "{status} {headers:?}");
         }
     }
 

@@ -25,6 +25,20 @@ zoneposture audit --zone example.com.zone
 
 Results are printed to the terminal.
 
+### Fixing findings
+
+Each finding starts with the id of the rule that produced it, such as `caa-missing` or `dmarc-policy`.
+`explain` prints what the rule checks, why it matters, how to fix it, and how to verify the fix:
+
+```bash
+zoneposture explain caa-missing
+```
+
+The text is embedded in the binary, so it works offline and always matches the installed version.
+The same documents are in [`docs/rules`](docs/rules), one file per id.
+
+To have a coding agent fix a finding, give it the finding line and the output of `explain` for its id.
+
 ### Without a zone file
 
 If the zone belongs to someone else, `snapshot` looks up the names you know in DNS and writes a partial zone file, which `audit` can then read:

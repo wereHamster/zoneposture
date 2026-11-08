@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::finding::{Finding, Severity};
+use crate::rules;
 use crate::zone::{RecordData, Zone};
 
 /// Tags registered with IANA. CAs must refuse to issue when they encounter an
@@ -37,6 +38,7 @@ pub fn audit(zone: &Zone) -> Vec<Finding> {
     if !owners.contains(zone.apex.as_str()) {
         findings.push(finding(
             &zone.apex,
+            rules::CAA_MISSING,
             Severity::Fail,
             format!(
                 "no CAA records; any CA may issue certificates for {} and its subdomains",
@@ -69,17 +71,17 @@ pub fn audit(zone: &Zone) -> Vec<Finding> {
     findings
 }
 
-fn finding(subject: &str, severity: Severity, message: String) -> Finding {
+fn finding(subject: &str, id: &'static str, severity: Severity, message: String) -> Finding {
     Finding {
         subject: subject.to_string(),
-        check: "CAA",
+        id,
         severity,
         message,
     }
 }
 
 fn check_record_set(owner: &str, properties: &[Property]) -> Vec<Finding> {
-    let caa = |severity, message| finding(owner, severity, message);
+    let caa = |id, severity, message| finding(owner, id, severity, message);
     let values = |tag: &str| -> Vec<&str> {
         properties
             .iter()
@@ -92,6 +94,7 @@ fn check_record_set(owner: &str, properties: &[Property]) -> Vec<Finding> {
     for property in properties {
         if property.critical && !KNOWN_TAGS.contains(&property.tag) {
             findings.push(caa(
+                rules::CAA_CRITICAL_TAG,
                 Severity::Fail,
                 format!(
                     "unknown tag {} is marked critical; CAs refuse to issue any certificate",
@@ -109,6 +112,7 @@ fn check_record_set(owner: &str, properties: &[Property]) -> Vec<Finding> {
     if issuewild.is_empty() {
         if issue_allows_some_ca {
             findings.push(caa(
+                rules::CAA_ISSUEWILD,
                 Severity::Warn,
                 "no issuewild tag; the CAs in issue may also issue wildcard certificates"
                     .to_string(),
@@ -121,6 +125,7 @@ fn check_record_set(owner: &str, properties: &[Property]) -> Vec<Finding> {
     let iodef = values("iodef");
     if iodef.is_empty() {
         findings.push(caa(
+            rules::CAA_IODEF,
             Severity::Warn,
             "no iodef tag; CAs cannot report requests that violate the policy".to_string(),
         ));
@@ -131,6 +136,7 @@ fn check_record_set(owner: &str, properties: &[Property]) -> Vec<Finding> {
             .map(|(scheme, _)| scheme.to_ascii_lowercase());
         if !matches!(scheme.as_deref(), Some("mailto" | "http" | "https")) {
             findings.push(caa(
+                rules::CAA_IODEF,
                 Severity::Fail,
                 format!("iodef value {url:?} is not a mailto:, http: or https: URL"),
             ));
@@ -202,7 +208,12 @@ fn is_domain_name(name: &str) -> bool {
 }
 
 fn check_issuers(owner: &str, tag: &str, values: &[&str]) -> Vec<Finding> {
-    let caa = |severity, message| finding(owner, severity, message);
+    let id = if tag == "issuewild" {
+        rules::CAA_ISSUEWILD
+    } else {
+        rules::CAA_ISSUE
+    };
+    let caa = |severity, message| finding(owner, id, severity, message);
 
     if values.is_empty() {
         return vec![caa(
@@ -258,6 +269,38 @@ mod tests {
 
     fn result(subject: &str, severity: Severity, message: &str) -> (String, Severity, String) {
         (subject.to_string(), severity, message.to_string())
+    }
+
+    fn ids(zone: &Zone) -> Vec<&'static str> {
+        audit(zone).iter().map(|f| f.id).collect()
+    }
+
+    #[test]
+    fn findings_carry_the_id_of_their_rule() {
+        assert_eq!(ids(&zone("www A 192.0.2.1\n")), ["caa-missing"]);
+        assert_eq!(
+            ids(&zone(
+                "@ CAA 128 tbs \"x\"
+@ CAA 0 issue \"letsencrypt.org\"
+@ CAA 0 iodef \"security@example.com\"
+"
+            )),
+            [
+                "caa-critical-tag",
+                "caa-issue",
+                "caa-issuewild",
+                "caa-iodef"
+            ]
+        );
+        assert_eq!(
+            ids(&zone(
+                "@ CAA 0 issue \";\"
+@ CAA 0 issuewild \"not a domain\"
+@ CAA 0 iodef \"mailto:security@example.com\"
+"
+            )),
+            ["caa-issue", "caa-issuewild", "caa-issuewild"]
+        );
     }
 
     #[test]
