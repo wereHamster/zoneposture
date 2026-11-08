@@ -33,6 +33,12 @@ pub enum RecordData {
     Mx(String),
     /// The character-strings of the record, concatenated.
     Txt(String),
+    Caa {
+        critical: bool,
+        /// Lowercase.
+        tag: String,
+        value: String,
+    },
 }
 
 impl RecordData {
@@ -43,6 +49,7 @@ impl RecordData {
             RecordData::Cname(_) => "CNAME",
             RecordData::Mx(_) => "MX",
             RecordData::Txt(_) => "TXT",
+            RecordData::Caa { .. } => "CAA",
         }
     }
 
@@ -61,6 +68,11 @@ impl fmt::Display for RecordData {
             RecordData::Aaaa(addr) => addr.fmt(f),
             RecordData::Cname(target) | RecordData::Mx(target) => target.fmt(f),
             RecordData::Txt(text) => write!(f, "{text:?}"),
+            RecordData::Caa {
+                critical,
+                tag,
+                value,
+            } => write!(f, "{} {tag} {value:?}", if *critical { 128 } else { 0 }),
         }
     }
 }
@@ -101,6 +113,11 @@ impl Zone {
                 ZoneRecordData::Txt(txt) => {
                     RecordData::Txt(String::from_utf8_lossy(&txt.text::<Vec<u8>>()).into_owned())
                 }
+                ZoneRecordData::Caa(caa) => RecordData::Caa {
+                    critical: caa.flags().bits() & 0x80 != 0,
+                    tag: caa.tag().to_string().to_ascii_lowercase(),
+                    value: String::from_utf8_lossy(caa.value()).into_owned(),
+                },
                 _ => continue,
             };
 

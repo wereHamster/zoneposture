@@ -1,3 +1,4 @@
+mod caa;
 mod email;
 mod finding;
 mod zone;
@@ -41,6 +42,8 @@ fn main() -> ExitCode {
             print_hosts(&zone);
             println!();
             print_findings("Email", &email::audit(&zone));
+            println!();
+            print_findings("TLS", &caa::audit(&zone));
 
             ExitCode::SUCCESS
         }
