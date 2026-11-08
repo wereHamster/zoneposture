@@ -1,12 +1,14 @@
 mod caa;
 mod email;
 mod finding;
+mod security_txt;
 mod zone;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use jiff::Timestamp;
 
 use crate::finding::Finding;
 use crate::zone::Zone;
@@ -28,7 +30,8 @@ enum Command {
     },
 }
 
-fn main() -> ExitCode {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Audit { zone } => {
             let zone = match Zone::read(&zone) {
@@ -38,12 +41,24 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            let client = match security_txt::client() {
+                Ok(client) => client,
+                Err(err) => {
+                    eprintln!("error: cannot create HTTP client: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
 
             print_hosts(&zone);
             println!();
             print_findings("Email", &email::audit(&zone));
             println!();
             print_findings("TLS", &caa::audit(&zone));
+            println!();
+            print_findings(
+                "Vulnerability disclosure",
+                &security_txt::audit(&client, &zone.web_hosts(), Timestamp::now()).await,
+            );
 
             ExitCode::SUCCESS
         }

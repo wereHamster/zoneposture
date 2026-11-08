@@ -135,12 +135,60 @@ impl Zone {
             .map(|r| &r.data)
     }
 
+    /// Names to probe over the network, in file order: every name with A,
+    /// AAAA, or CNAME records, except service names (`_dmarc`, `_domainkey`,
+    /// …), wildcards, and names whose addresses are all non-public.
+    pub fn web_hosts(&self) -> Vec<&str> {
+        let mut hosts: Vec<&str> = Vec::new();
+        for record in &self.records {
+            let name = record.name.as_str();
+            if !record.data.is_host()
+                || hosts.contains(&name)
+                || name
+                    .split('.')
+                    .any(|label| label.starts_with('_') || label == "*")
+            {
+                continue;
+            }
+            let reachable = self.records_at(name).any(|data| match data {
+                RecordData::A(addr) => is_public_v4(addr),
+                RecordData::Aaaa(addr) => is_public_v6(addr),
+                RecordData::Cname(_) => true,
+                _ => false,
+            });
+            if reachable {
+                hosts.push(name);
+            }
+        }
+        hosts
+    }
+
     pub fn txt_at<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
         self.records_at(name).filter_map(|data| match data {
             RecordData::Txt(text) => Some(text.as_str()),
             _ => None,
         })
     }
+}
+
+fn is_public_v4(addr: &Ipv4Addr) -> bool {
+    let shared = addr.octets()[0] == 100 && (addr.octets()[1] & 0xc0) == 64;
+    !(addr.is_private()
+        || addr.is_loopback()
+        || addr.is_link_local()
+        || addr.is_unspecified()
+        || addr.is_broadcast()
+        || addr.is_documentation()
+        || shared)
+}
+
+fn is_public_v6(addr: &Ipv6Addr) -> bool {
+    let documentation = addr.segments()[0] == 0x2001 && addr.segments()[1] == 0x0db8;
+    !(addr.is_loopback()
+        || addr.is_unspecified()
+        || addr.is_unique_local()
+        || addr.is_unicast_link_local()
+        || documentation)
 }
 
 fn normalize_name(name: String) -> String {
@@ -263,6 +311,32 @@ blog  CNAME www
     fn rejects_relative_name_without_origin() {
         let err = parse_str("www 300 IN A 192.0.2.1\n").unwrap_err();
         assert!(err.to_string().contains("missing origin"), "{err}");
+    }
+
+    #[test]
+    fn web_hosts_skip_service_wildcard_and_non_public_names() {
+        let zone = parse_str(
+            "$ORIGIN example.com.
+@                 IN SOA ns admin 1 3600 600 86400 300
+@                 A     192.0.2.10
+@                 A     9.9.9.9
+@                 AAAA  2a00:1450::1
+www               CNAME example.com.
+s1._domainkey     CNAME s1.example.net.
+*                 A     9.9.9.9
+dev               A     127.0.0.1
+lan               A     10.0.0.1
+lan               AAAA  fd00::1
+cgnat             A     100.64.0.1
+mixed             A     10.0.0.1
+mixed             A     9.9.9.9
+",
+        )
+        .unwrap();
+        assert_eq!(
+            zone.web_hosts(),
+            ["example.com", "www.example.com", "mixed.example.com"]
+        );
     }
 
     #[test]
