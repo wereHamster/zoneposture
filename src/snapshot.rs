@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fmt::Write;
 use std::hash::{BuildHasher, Hasher};
 
-use futures::future::try_join_all;
+use futures::stream::{self, StreamExt};
 use jiff::Timestamp;
 
 use crate::dns::{Qtype, Rdata, Resolve, Rr};
@@ -76,7 +76,9 @@ pub async fn snapshot(resolver: &impl Resolve, names: &[String]) -> Result<Snaps
             continue;
         }
         records.extend(basics);
-        records.extend(mail_conventions(resolver, domain).await?);
+        let (conventional, failed) = mail_conventions(resolver, domain).await?;
+        records.extend(conventional);
+        warnings.extend(failed);
     }
 
     for owner in caa_owners(&visited, &apex) {
@@ -173,8 +175,11 @@ async fn mail_basics(resolver: &impl Resolve, name: &str) -> Result<Vec<Rr>, Str
 }
 
 /// Labels under a mail domain at which policies are published by convention:
-/// DMARC, MTA-STS (RFC 8461), TLS reporting (RFC 8460), and BIMI.
-const MAIL_POLICY_LABELS: &[&str] = &["_dmarc", "_mta-sts", "_smtp._tls", "default._bimi"];
+/// MTA-STS (RFC 8461), TLS reporting (RFC 8460), and BIMI. DMARC is looked up
+/// separately because the audit grades it.
+const MAIL_POLICY_LABELS: &[&str] = &["_mta-sts", "_smtp._tls", "default._bimi"];
+
+const MAX_CONCURRENT_LOOKUPS: usize = 8;
 
 /// DKIM selectors are chosen by the sender and cannot be listed in DNS, so
 /// only the defaults of common mail providers can be found.
@@ -203,8 +208,18 @@ const DKIM_SELECTORS: &[&str] = &[
 ];
 
 /// The records at the conventional names under the mail domain `domain`,
-/// and the host that serves its MTA-STS policy if it has one.
-async fn mail_conventions(resolver: &impl Resolve, domain: &str) -> Result<Vec<Rr>, String> {
+/// and the host that serves its MTA-STS policy if it has one, with a warning
+/// for each lookup that failed.
+///
+/// A failed lookup of the DMARC record is an error, since the audit would
+/// report it as missing. The other names are guesses that the audit does not
+/// grade, so a failed lookup there only makes the result incomplete.
+async fn mail_conventions(
+    resolver: &impl Resolve,
+    domain: &str,
+) -> Result<(Vec<Rr>, Vec<String>), String> {
+    let mut records = alias_or_text(resolver, &format!("_dmarc.{domain}")).await?;
+
     let names: Vec<String> = MAIL_POLICY_LABELS
         .iter()
         .map(|label| format!("{label}.{domain}"))
@@ -214,17 +229,33 @@ async fn mail_conventions(resolver: &impl Resolve, domain: &str) -> Result<Vec<R
                 .map(|selector| format!("{selector}._domainkey.{domain}")),
         )
         .collect();
-    let mut records: Vec<Rr> = try_join_all(names.iter().map(|name| alias_or_text(resolver, name)))
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
+    let results: Vec<Result<Vec<Rr>, String>> = stream::iter(&names)
+        .map(|name| alias_or_text(resolver, name))
+        .buffered(MAX_CONCURRENT_LOOKUPS)
+        .collect()
+        .await;
+
+    let mut errors = Vec::new();
+    for result in results {
+        match result {
+            Ok(found) => records.extend(found),
+            Err(err) => errors.push(err),
+        }
+    }
 
     let mta_sts = format!("_mta-sts.{domain}");
     if records.iter().any(|rr| rr.owner == mta_sts) {
-        records.extend(host_records(resolver, &format!("mta-sts.{domain}")).await?);
+        match host_records(resolver, &format!("mta-sts.{domain}")).await {
+            Ok(found) => records.extend(found),
+            Err(err) => errors.push(err),
+        }
     }
-    Ok(records)
+
+    let warnings = errors
+        .into_iter()
+        .map(|err| format!("{err}; skipped, the snapshot may be missing records there"))
+        .collect();
+    Ok((records, warnings))
 }
 
 /// The CNAME at `name`, or if there is none, its TXT records.
@@ -715,6 +746,50 @@ mod tests {
         assert!(resolver.queried("_dmarc.mail.client.com"));
         assert!(resolver.queried("_dmarc.client.com"));
         assert!(!resolver.queried("_dmarc.www.client.com"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_optional_mail_lookup_is_a_warning() {
+        let mut resolver = client_zone()
+            .with(
+                "client.com",
+                Qtype::A,
+                Rdata::A("192.0.2.1".parse().unwrap()),
+            )
+            .with("_dmarc.client.com", Qtype::Txt, txt("v=DMARC1; p=reject"))
+            .with("s1._domainkey.client.com", Qtype::Txt, txt("v=DKIM1"));
+        resolver.errors.insert(
+            ("_mta-sts.client.com", Qtype::Txt),
+            "_mta-sts.client.com: Txt query failed: all timed out".to_string(),
+        );
+
+        let snapshot = snapshot(&resolver, &names(&["client.com"])).await.unwrap();
+
+        assert_eq!(
+            snapshot.warnings,
+            ["_mta-sts.client.com: Txt query failed: all timed out; \
+                 skipped, the snapshot may be missing records there"]
+        );
+        for owner in ["_dmarc.client.com", "s1._domainkey.client.com"] {
+            assert!(
+                snapshot.records.iter().any(|rr| rr.owner == owner),
+                "{owner}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_dmarc_lookup_is_an_error() {
+        let mut resolver = client_zone();
+        resolver
+            .errors
+            .insert(("_dmarc.client.com", Qtype::Txt), "timed out".to_string());
+
+        let err = snapshot(&resolver, &names(&["client.com"]))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, "timed out");
     }
 
     #[test]
