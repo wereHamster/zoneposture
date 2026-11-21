@@ -205,6 +205,7 @@ enum Outcome {
 pub async fn check_host(
     context: &Context,
     zone: &Zone,
+    unresolved: &[caa::Unresolved],
     host: &str,
     now: Timestamp,
 ) -> Vec<Finding> {
@@ -236,7 +237,7 @@ pub async fn check_host(
     .await;
 
     let mut findings = grade_addresses(host, &outcomes, now);
-    findings.extend(check_caa(zone, host, &outcomes));
+    findings.extend(check_caa(zone, unresolved, host, &outcomes));
     findings
 }
 
@@ -504,7 +505,12 @@ fn ca_domains(organization: &str) -> Option<&'static [&'static str]> {
         .map(|(_, domains)| *domains)
 }
 
-fn check_caa(zone: &Zone, host: &str, outcomes: &[(IpAddr, Outcome)]) -> Vec<Finding> {
+fn check_caa(
+    zone: &Zone,
+    unresolved: &[caa::Unresolved],
+    host: &str,
+    outcomes: &[(IpAddr, Outcome)],
+) -> Vec<Finding> {
     let mut certificates: Vec<&CertInfo> = Vec::new();
     for (_, outcome) in outcomes {
         if let Outcome::Certificate { info, .. } = outcome
@@ -516,10 +522,10 @@ fn check_caa(zone: &Zone, host: &str, outcomes: &[(IpAddr, Outcome)]) -> Vec<Fin
         }
     }
 
-    let cname_target = zone.records_at(host).find_map(|data| match data {
-        RecordData::Cname(target) => Some(target.as_str()),
-        _ => None,
-    });
+    let unknown_target = unresolved
+        .iter()
+        .find(|entry| entry.host == host)
+        .map(|entry| entry.target.as_str());
 
     certificates
         .into_iter()
@@ -529,7 +535,7 @@ fn check_caa(zone: &Zone, host: &str, outcomes: &[(IpAddr, Outcome)]) -> Vec<Fin
                 info.issuer_organization.as_deref(),
                 &owner,
                 &allowed,
-                cname_target,
+                unknown_target,
             );
             Some(finding(host, rules::CERTIFICATE_CAA, severity, message))
         })

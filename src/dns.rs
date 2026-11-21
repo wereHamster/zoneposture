@@ -180,3 +180,42 @@ impl Resolve for System {
         Ok(records)
     }
 }
+
+/// Resolvers give up on longer CNAME chains, and the limit guards against
+/// loops.
+pub const MAX_ALIASES: usize = 8;
+
+/// The CAA records that a lookup of `name` returns. If they come from the end
+/// of a CNAME chain, the CNAME records of the chain come first.
+pub async fn caa_records(resolver: &impl Resolve, name: &str) -> Result<Vec<Rr>, String> {
+    let answer = resolver.query(name, Qtype::Caa).await?;
+    let Some(end) = answer.first().map(|rr| rr.owner.clone()) else {
+        return Ok(Vec::new());
+    };
+
+    let mut records = Vec::new();
+    let mut current = name.to_string();
+    for _ in 0..=MAX_ALIASES {
+        if current == end {
+            records.extend(answer.into_iter().filter(|rr| rr.owner == end));
+            return Ok(records);
+        }
+        let cname = resolver
+            .query(&current, Qtype::Cname)
+            .await?
+            .into_iter()
+            .find(|rr| rr.owner == current);
+        let Some(Rr {
+            data: Rdata::Cname(target),
+            ..
+        }) = &cname
+        else {
+            break;
+        };
+        current = target.clone();
+        records.extend(cname);
+    }
+    Err(format!(
+        "{name}: the CAA answer is owned by {end}, which the CNAME chain of {name} does not lead to"
+    ))
+}

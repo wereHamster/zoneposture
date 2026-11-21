@@ -3,6 +3,7 @@ use jiff::Timestamp;
 use reqwest::Url;
 use reqwest::header::LOCATION;
 
+use crate::caa;
 use crate::finding::{Finding, Severity};
 use crate::headers;
 use crate::http::{Clients, Response, fetch};
@@ -26,7 +27,13 @@ pub struct Report {
     pub disclosure: Vec<Finding>,
 }
 
-pub async fn audit(clients: &Clients, tls: &tls::Context, zone: &Zone, now: Timestamp) -> Report {
+pub async fn audit(
+    clients: &Clients,
+    tls: &tls::Context,
+    zone: &Zone,
+    unresolved: &[caa::Unresolved],
+    now: Timestamp,
+) -> Report {
     let reports: Vec<Report> = stream::iter(zone.web_hosts())
         .map(|host| async move {
             match &host.skip {
@@ -34,7 +41,7 @@ pub async fn audit(clients: &Clients, tls: &tls::Context, zone: &Zone, now: Time
                     https: vec![skipped(host.name, skip, &zone.apex)],
                     ..Report::default()
                 },
-                None => audit_host(clients, tls, zone, host.name, now).await,
+                None => audit_host(clients, tls, zone, unresolved, host.name, now).await,
             }
         })
         .buffered(CONCURRENT_HOSTS)
@@ -95,6 +102,7 @@ async fn audit_host(
     clients: &Clients,
     tls: &tls::Context,
     zone: &Zone,
+    unresolved: &[caa::Unresolved],
     host: &str,
     now: Timestamp,
 ) -> Report {
@@ -102,7 +110,7 @@ async fn audit_host(
     let (root, redirect, certificates) = tokio::join!(
         fetch(&clients.https, &url, false),
         check_http_redirect(clients, host),
-        tls::check_host(tls, zone, host, now),
+        tls::check_host(tls, zone, unresolved, host, now),
     );
 
     match root {

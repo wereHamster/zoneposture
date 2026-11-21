@@ -135,13 +135,24 @@ impl Zone {
             .map(|r| &r.data)
     }
 
-    /// Every name with A, AAAA, or CNAME records, in file order, except
-    /// service names (`_dmarc`, `_domainkey`, …), which are not web hosts.
+    /// Whether `name` is the apex or below it. A snapshot also holds records
+    /// of names outside the zone, such as the CAA records of a CNAME target.
+    pub fn contains(&self, name: &str) -> bool {
+        name == self.apex
+            || name
+                .strip_suffix(self.apex.as_str())
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    }
+
+    /// Every name in the zone with A, AAAA, or CNAME records, in file order,
+    /// except service names (`_dmarc`, `_domainkey`, …), which are not web
+    /// hosts.
     pub fn web_hosts(&self) -> Vec<WebHost<'_>> {
         let mut hosts: Vec<WebHost> = Vec::new();
         for record in &self.records {
             let name = record.name.as_str();
             if !record.data.is_host()
+                || !self.contains(name)
                 || hosts.iter().any(|host| host.name == name)
                 || name.split('.').any(|label| label.starts_with('_'))
             {
@@ -358,7 +369,7 @@ blog  CNAME www
     }
 
     #[test]
-    fn web_hosts_skip_service_wildcard_and_non_public_names() {
+    fn web_hosts_skip_service_wildcard_non_public_and_foreign_names() {
         let zone = parse_str(
             "$ORIGIN example.com.
 @                 IN SOA ns admin 1 3600 600 86400 300
@@ -374,6 +385,8 @@ lan               AAAA  fd00::1
 cgnat             A     100.64.0.1
 mixed             A     10.0.0.1
 mixed             A     9.9.9.9
+alias.example.net. CNAME pages.example.org.
+notexample.com.   A     9.9.9.9
 ",
         )
         .unwrap();

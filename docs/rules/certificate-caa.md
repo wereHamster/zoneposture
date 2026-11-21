@@ -26,7 +26,7 @@ Do not remove the CA from the records before the certificate setup has changed.
 For the WARN cases:
 
 - If the issuer cannot be mapped to a CAA domain, look up its CAA domain in its documentation and compare it with the records at the owner name manually.
-- If the host is a CNAME, CAA records at the alias target take precedence when they exist.
+- If the host is a CNAME to a name outside the zone and the CAA lookup at that name failed, CAA records there take precedence when they exist.
   Check them at the target.
 
 ## Verify

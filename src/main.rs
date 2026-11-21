@@ -54,7 +54,7 @@ enum Command {
 async fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Audit { zone } => {
-            let zone = match Zone::read(&zone) {
+            let mut zone = match Zone::read(&zone) {
                 Ok(zone) => zone,
                 Err(err) => {
                     eprintln!("error: {}: {err}", zone.display());
@@ -82,10 +82,11 @@ async fn main() -> ExitCode {
             let email = email::audit(&zone);
             print_findings("Email", &email);
             println!();
-            let caa = caa::audit(&zone);
+            let unresolved = caa::add_alias_targets(&dns::System::new(), &mut zone).await;
+            let caa = caa::audit(&zone, &unresolved);
             print_findings("CAA", &caa);
 
-            let web = web::audit(&clients, &tls, &zone, Timestamp::now()).await;
+            let web = web::audit(&clients, &tls, &zone, &unresolved, Timestamp::now()).await;
             println!();
             print_findings("HTTPS", &web.https);
             println!();
@@ -146,7 +147,11 @@ async fn main() -> ExitCode {
 }
 
 fn print_hosts(zone: &Zone) {
-    let hosts: Vec<_> = zone.records.iter().filter(|r| r.data.is_host()).collect();
+    let hosts: Vec<_> = zone
+        .records
+        .iter()
+        .filter(|r| r.data.is_host() && zone.contains(&r.name))
+        .collect();
     let name_width = hosts.iter().map(|r| r.name.len()).max().unwrap_or(0);
 
     println!("Hosts");
