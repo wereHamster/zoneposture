@@ -24,6 +24,8 @@ zoneposture audit --zone example.com.zone
 ```
 
 Results are printed to the terminal.
+Checks that passed are counted per section but not listed, so warnings and failures stand out.
+To list them too, add `--all`.
 
 ### Fixing findings
 
