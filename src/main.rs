@@ -35,6 +35,9 @@ enum Command {
         /// Path to the zone file, in standard BIND format
         #[arg(long, value_name = "FILE")]
         zone: PathBuf,
+        /// Also show the checks that passed
+        #[arg(long)]
+        all: bool,
     },
     /// Look up names in DNS and write a partial zone file for `audit` to stdout
     Snapshot {
@@ -53,7 +56,7 @@ enum Command {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Audit { zone } => {
+        Command::Audit { zone, all } => {
             let mut zone = match Zone::read(&zone) {
                 Ok(zone) => zone,
                 Err(err) => {
@@ -80,21 +83,21 @@ async fn main() -> ExitCode {
             print_hosts(&zone);
             println!();
             let email = email::audit(&zone);
-            print_findings("Email", &email);
+            print_findings("Email", &email, all);
             println!();
             let unresolved = caa::add_alias_targets(&dns::System::new(), &mut zone).await;
             let caa = caa::audit(&zone, &unresolved);
-            print_findings("CAA", &caa);
+            print_findings("CAA", &caa, all);
 
             let web = web::audit(&clients, &tls, &zone, &unresolved, Timestamp::now()).await;
             println!();
-            print_findings("HTTPS", &web.https);
+            print_findings("HTTPS", &web.https, all);
             println!();
-            print_findings("Certificates", &web.certificates);
+            print_findings("Certificates", &web.certificates, all);
             println!();
-            print_findings("Security headers", &web.headers);
+            print_findings("Security headers", &web.headers, all);
             println!();
-            print_findings("Vulnerability disclosure", &web.disclosure);
+            print_findings("Vulnerability disclosure", &web.disclosure, all);
 
             let sections = [
                 &email,
@@ -104,12 +107,16 @@ async fn main() -> ExitCode {
                 &web.headers,
                 &web.disclosure,
             ];
-            if sections
-                .iter()
-                .flat_map(|findings| findings.iter())
-                .any(|finding| finding.severity >= Severity::Warn)
-            {
+            let findings = || sections.iter().flat_map(|findings| findings.iter());
+            let hidden = !all && findings().any(|finding| finding.severity == Severity::Pass);
+            let actionable = findings().any(|finding| finding.severity >= Severity::Warn);
+            if hidden || actionable {
                 println!();
+            }
+            if hidden {
+                println!("Run with `--all` to also show the checks that passed.");
+            }
+            if actionable {
                 println!("Run `zoneposture explain <id>` to see how to fix a finding.");
             }
 
@@ -165,12 +172,15 @@ fn print_hosts(zone: &Zone) {
     }
 }
 
-fn print_findings(title: &str, findings: &[Finding]) {
-    let id_width = findings.iter().map(|f| f.id.len()).max().unwrap_or(0);
+fn print_findings(title: &str, findings: &[Finding], all: bool) {
+    let (shown, passed): (Vec<_>, Vec<_>) = findings
+        .iter()
+        .partition(|f| all || f.severity != Severity::Pass);
+    let id_width = shown.iter().map(|f| f.id.len()).max().unwrap_or(0);
 
     println!("{title}");
     let mut subject = None;
-    for finding in findings {
+    for finding in shown {
         if subject != Some(&finding.subject) {
             subject = Some(&finding.subject);
             println!("  {}", finding.subject);
@@ -179,5 +189,10 @@ fn print_findings(title: &str, findings: &[Finding]) {
             "    {}  {:id_width$}  {}",
             finding.severity, finding.id, finding.message
         );
+    }
+    match passed.len() {
+        0 => {}
+        1 => println!("  1 check passed"),
+        n => println!("  {n} checks passed"),
     }
 }
