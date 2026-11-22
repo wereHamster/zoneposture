@@ -10,7 +10,7 @@
 - **Security & Compliance Audits:**
   - **Vulnerability Disclosure:** Checks for RFC 9116 compliance (`/.well-known/security.txt`).
   - **TLS/SSL Health:** Validates certificate validity, chain integrity, and expiration warnings, and checks CAA records restricting which certificate authorities may issue certificates.
-  - **Security Headers:** Audits HSTS (`Strict-Transport-Security`), CSP (`Content-Security-Policy`), and clickjacking protections (`X-Frame-Options`).
+  - **Security Headers:** Audits HSTS (`Strict-Transport-Security`), CSP (`Content-Security-Policy`), clickjacking protections (`X-Frame-Options`), and MIME sniffing protection (`X-Content-Type-Options`).
   - **Email Posture:** Audits DNS-level records (DMARC, SPF) to prevent domain spoofing.
 
 ---

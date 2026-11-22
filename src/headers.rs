@@ -1,6 +1,6 @@
 use reqwest::header::{
     CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY_REPORT_ONLY, HeaderMap, HeaderName,
-    STRICT_TRANSPORT_SECURITY, X_FRAME_OPTIONS,
+    STRICT_TRANSPORT_SECURITY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
 };
 
 use crate::finding::{Finding, Severity};
@@ -12,6 +12,7 @@ const ONE_YEAR_SECONDS: u64 = 365 * 24 * 60 * 60;
 /// Grades the security headers of the response to `https://<host>/`.
 pub fn grade(host: &str, is_apex: bool, response: &Response) -> Vec<Finding> {
     let mut findings = check_hsts(host, is_apex, &response.headers);
+    findings.push(check_nosniff(host, &response.headers));
 
     // Browsers sniff responses without a Content-Type, so those may render
     // as HTML too.
@@ -123,6 +124,31 @@ fn check_hsts(host: &str, is_apex: bool, headers: &HeaderMap) -> Vec<Finding> {
         ));
     }
     findings
+}
+
+fn check_nosniff(host: &str, headers: &HeaderMap) -> Finding {
+    let nosniff =
+        |severity, message| finding(host, rules::X_CONTENT_TYPE_OPTIONS, severity, message);
+
+    // Browsers combine all X-Content-Type-Options headers into one list and
+    // only look at its first value.
+    let value = header_values(headers, &X_CONTENT_TYPE_OPTIONS)
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .next();
+    match value {
+        Some(value) if value.eq_ignore_ascii_case("nosniff") => {
+            nosniff(Severity::Pass, "nosniff".to_string())
+        }
+        Some(value) => nosniff(
+            Severity::Fail,
+            format!("X-Content-Type-Options {value:?} is not nosniff; browsers ignore it"),
+        ),
+        None => nosniff(
+            Severity::Fail,
+            "no X-Content-Type-Options: nosniff; browsers may sniff the content type".to_string(),
+        ),
+    }
 }
 
 /// A parsed CSP: directive names are lowercase, and only the first occurrence
@@ -329,10 +355,12 @@ mod tests {
         "content-security-policy",
         "default-src 'self'; frame-ancestors 'none'",
     );
+    const NOSNIFF: (&str, &str) = ("x-content-type-options", "nosniff");
 
     const HSTS_IDS: &[&str] = &["hsts-policy", "hsts-include-subdomains"];
     const CSP_IDS: &[&str] = &["csp-enforced", "csp-script-src", "csp-object-src"];
     const FRAMING_IDS: &[&str] = &["csp-frame-ancestors"];
+    const NOSNIFF_IDS: &[&str] = &["x-content-type-options"];
 
     fn results(is_apex: bool, headers: &[(&str, &str)]) -> Vec<(&'static str, Severity, String)> {
         grade("example.com", is_apex, &response(200, headers, ""))
@@ -363,12 +391,17 @@ mod tests {
     #[test]
     fn strong_headers_pass() {
         assert_eq!(
-            results(true, &[HTML, HSTS, CSP]),
+            results(true, &[HTML, HSTS, CSP, NOSNIFF]),
             [
                 (
                     "hsts-policy",
                     Severity::Pass,
                     "max-age=63072000; includeSubDomains; preload".to_string()
+                ),
+                (
+                    "x-content-type-options",
+                    Severity::Pass,
+                    "nosniff".to_string()
                 ),
                 (
                     "csp-script-src",
@@ -449,6 +482,61 @@ mod tests {
     }
 
     #[test]
+    fn nosniff_grades() {
+        for (values, expected) in [
+            (
+                vec![],
+                result(
+                    Severity::Fail,
+                    "no X-Content-Type-Options: nosniff; browsers may sniff the content type",
+                ),
+            ),
+            (vec!["NoSniff"], result(Severity::Pass, "nosniff")),
+            (vec![" nosniff , foo"], result(Severity::Pass, "nosniff")),
+            (
+                vec!["sniff"],
+                result(
+                    Severity::Fail,
+                    "X-Content-Type-Options \"sniff\" is not nosniff; browsers ignore it",
+                ),
+            ),
+            (
+                vec!["foo", "nosniff"],
+                result(
+                    Severity::Fail,
+                    "X-Content-Type-Options \"foo\" is not nosniff; browsers ignore it",
+                ),
+            ),
+        ] {
+            let mut headers = vec![HTML, HSTS, CSP];
+            headers.extend(
+                values
+                    .iter()
+                    .map(|value| ("x-content-type-options", *value)),
+            );
+            assert_eq!(
+                check(&results(false, &headers), NOSNIFF_IDS),
+                [expected],
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nosniff_applies_to_non_html() {
+        assert_eq!(
+            check(
+                &results(false, &[("content-type", "image/png"), HSTS]),
+                NOSNIFF_IDS
+            ),
+            [result(
+                Severity::Fail,
+                "no X-Content-Type-Options: nosniff; browsers may sniff the content type",
+            )]
+        );
+    }
+
+    #[test]
     fn missing_and_report_only_csp() {
         assert_eq!(
             check(&results(false, &[HTML, HSTS]), CSP_IDS),
@@ -490,6 +578,7 @@ mod tests {
             ids(&findings),
             [
                 "hsts-policy",
+                "x-content-type-options",
                 "csp-script-src",
                 "csp-script-src",
                 "csp-script-src",
@@ -644,13 +733,14 @@ mod tests {
     #[test]
     fn non_html_skips_csp_and_framing() {
         assert_eq!(
-            results(false, &[("content-type", "application/json"), HSTS]),
+            results(false, &[("content-type", "application/json"), HSTS, NOSNIFF]),
             [
                 (
                     "hsts-policy",
                     Severity::Pass,
                     "max-age=63072000; includeSubDomains; preload".to_string()
                 ),
+                ("x-content-type-options", Severity::Pass, "nosniff".to_string()),
                 (
                     "csp-enforced",
                     Severity::Pass,
