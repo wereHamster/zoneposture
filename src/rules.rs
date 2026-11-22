@@ -33,6 +33,7 @@ rules! {
     DMARC_RUA = "dmarc-rua";
     HSTS_POLICY = "hsts-policy";
     HSTS_INCLUDE_SUBDOMAINS = "hsts-include-subdomains";
+    X_CONTENT_TYPE_OPTIONS = "x-content-type-options";
     CSP_ENFORCED = "csp-enforced";
     CSP_SCRIPT_SRC = "csp-script-src";
     CSP_OBJECT_SRC = "csp-object-src";
